@@ -1,0 +1,25 @@
+# Models (large binary files)
+models/
+*.gguf
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Rust
+target/
+eml_rust/target/
+Cargo.lock
+
+# macOS
+.DS_Store
+
+# Editor
+*.bak
+*.swp
+*~
+
+# IDE
+.idea/
+.vscode/
