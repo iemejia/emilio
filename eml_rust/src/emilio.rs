@@ -92,6 +92,16 @@ pub struct LayerWeights {
 
     // FFN norm
     pub ffn_norm: Vec<f64>,  // (d_model,)
+
+    // Precomputed ln(W) in (cols, inner) layout for each weight matrix.
+    // These are element-wise ln of the GGUF-layout weights (double-transpose cancels).
+    pub ln_q: Vec<Complex64>,
+    pub ln_k: Vec<Complex64>,
+    pub ln_v: Vec<Complex64>,
+    pub ln_o: Vec<Complex64>,
+    pub ln_gate: Vec<Complex64>,
+    pub ln_up: Vec<Complex64>,
+    pub ln_down: Vec<Complex64>,
 }
 
 pub struct ModelWeights {
@@ -99,6 +109,7 @@ pub struct ModelWeights {
     pub token_embd: Vec<f64>,   // (vocab, d_model)
     pub output_norm: Vec<f64>,  // (d_model,)
     pub output_weight: Vec<f64>, // (d_model, vocab) — may be tied to token_embd
+    pub ln_output: Vec<Complex64>, // precomputed ln(output_weight) transposed: (vocab, d_model)
     pub layers: Vec<LayerWeights>,
 }
 
@@ -146,19 +157,36 @@ impl ModelWeights {
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
             let pfx = format!("blk.{i}");
+            let q_weight = load_tensor(gguf, &format!("{pfx}.attn_q.weight"))?;
+            let k_weight = load_tensor(gguf, &format!("{pfx}.attn_k.weight"))?;
+            let v_weight = load_tensor(gguf, &format!("{pfx}.attn_v.weight"))?;
+            let o_weight = load_tensor(gguf, &format!("{pfx}.attn_output.weight"))?;
+            let gate_weight = load_tensor(gguf, &format!("{pfx}.ffn_gate.weight"))?;
+            let up_weight = load_tensor(gguf, &format!("{pfx}.ffn_up.weight"))?;
+            let down_weight = load_tensor(gguf, &format!("{pfx}.ffn_down.weight"))?;
+
+            // Precompute ln(W) — element-wise ln of GGUF layout weights.
+            // For layer weights stored as (out_dim, in_dim), the double-transpose
+            // (emilio transpose + matmul ln-transpose) cancels, so element-wise
+            // ln gives us the correct (cols, inner) layout directly.
+            let ln_q = precompute_ln_weight(&q_weight);
+            let ln_k = precompute_ln_weight(&k_weight);
+            let ln_v = precompute_ln_weight(&v_weight);
+            let ln_o = precompute_ln_weight(&o_weight);
+            let ln_gate = precompute_ln_weight(&gate_weight);
+            let ln_up = precompute_ln_weight(&up_weight);
+            let ln_down = precompute_ln_weight(&down_weight);
+
             let layer = LayerWeights {
-                q_weight: load_tensor(gguf, &format!("{pfx}.attn_q.weight"))?,
-                k_weight: load_tensor(gguf, &format!("{pfx}.attn_k.weight"))?,
-                v_weight: load_tensor(gguf, &format!("{pfx}.attn_v.weight"))?,
+                q_weight, k_weight, v_weight,
                 q_bias: load_tensor(gguf, &format!("{pfx}.attn_q.bias"))?,
                 k_bias: load_tensor(gguf, &format!("{pfx}.attn_k.bias"))?,
                 v_bias: load_tensor(gguf, &format!("{pfx}.attn_v.bias"))?,
-                o_weight: load_tensor(gguf, &format!("{pfx}.attn_output.weight"))?,
+                o_weight,
                 attn_norm: load_tensor(gguf, &format!("{pfx}.attn_norm.weight"))?,
-                gate_weight: load_tensor(gguf, &format!("{pfx}.ffn_gate.weight"))?,
-                up_weight: load_tensor(gguf, &format!("{pfx}.ffn_up.weight"))?,
-                down_weight: load_tensor(gguf, &format!("{pfx}.ffn_down.weight"))?,
+                gate_weight, up_weight, down_weight,
                 ffn_norm: load_tensor(gguf, &format!("{pfx}.ffn_norm.weight"))?,
+                ln_q, ln_k, ln_v, ln_o, ln_gate, ln_up, ln_down,
             };
             layers.push(layer);
             if (i + 1) % 8 == 0 || i == config.n_layers - 1 {
@@ -166,7 +194,14 @@ impl ModelWeights {
             }
         }
 
-        Ok(ModelWeights { config, token_embd, output_norm, output_weight, layers })
+        // Precompute ln(output_weight) — output_weight is (d_model, vocab),
+        // which is (inner, cols). Needs a real transpose to (vocab, d_model).
+        let ln_output = precompute_ln_weight_transposed(
+            &output_weight, config.d_model, config.vocab_size,
+        );
+        println!("  Precomputed ln(weights) for all layers + LM head");
+
+        Ok(ModelWeights { config, token_embd, output_norm, output_weight, ln_output, layers })
     }
 }
 
@@ -397,9 +432,9 @@ pub fn emilio_forward(
     }
 
     // 4. LM head: (T, d_model) @ (d_model, vocab)
-    // output_weight stored as (d_model, vocab) if tied
-    let logits = build_matmul_cse(
-        &normed, &weights.output_weight,
+    // Use precomputed ln(output_weight) transposed
+    let logits = build_matmul_cse_precomp(
+        &normed, &weights.ln_output,
         t, d, cfg.vocab_size,
     );
 
@@ -433,7 +468,7 @@ pub fn emilio_forward_one(
     let normed = eml_rms_norm(&x, &weights.output_norm, cfg.rms_norm_eps);
 
     // 4. LM head: (1, d_model) @ (d_model, vocab)
-    build_matmul_cse(&normed, &weights.output_weight, 1, d, cfg.vocab_size)
+    build_matmul_cse_precomp(&normed, &weights.ln_output, 1, d, cfg.vocab_size)
 }
 
 fn transformer_layer(
@@ -531,13 +566,10 @@ fn eml_gqa_attention_one(
     let kv_dim = n_kv_heads * d_head;
 
     // QKV projections for single token: (1, d) @ (d, out_dim)
-    let q_wt = transpose(&layer.q_weight, q_dim, d);
-    let k_wt = transpose(&layer.k_weight, kv_dim, d);
-    let v_wt = transpose(&layer.v_weight, kv_dim, d);
-
-    let mut q = build_matmul_cse(x, &q_wt, 1, d, q_dim);
-    let mut k_new = build_matmul_cse(x, &k_wt, 1, d, kv_dim);
-    let mut v_new = build_matmul_cse(x, &v_wt, 1, d, kv_dim);
+    // Use precomputed ln(W) — no transpose or ln needed
+    let mut q = build_matmul_cse_precomp(x, &layer.ln_q, 1, d, q_dim);
+    let mut k_new = build_matmul_cse_precomp(x, &layer.ln_k, 1, d, kv_dim);
+    let mut v_new = build_matmul_cse_precomp(x, &layer.ln_v, 1, d, kv_dim);
 
     // Add bias
     for j in 0..q_dim {
@@ -594,8 +626,7 @@ fn eml_gqa_attention_one(
     }
 
     // Output projection
-    let o_wt = transpose(&layer.o_weight, d, q_dim);
-    build_matmul_cse(&out, &o_wt, 1, q_dim, d)
+    build_matmul_cse_precomp(&out, &layer.ln_o, 1, q_dim, d)
 }
 
 // ─── GQA Attention (full sequence, for prefill) ─────────────────────────────
@@ -613,22 +644,13 @@ fn eml_gqa_attention(
     let n_kv_heads = cfg.n_kv_heads;
     let heads_per_kv = n_heads / n_kv_heads;
 
-    // QKV projections via CSE matmul
-    // GGUF stores weights as (out_features, in_features)
-    // So q_weight is (n_heads*d_head, d_model), we need x @ q_weight^T
-    // which is (T, d_model) @ (d_model, n_heads*d_head)
-    // We need to transpose the weight matrices
+    // QKV projections via precomputed ln(W) — no transpose or ln needed
     let q_dim = n_heads * d_head;
     let kv_dim = n_kv_heads * d_head;
 
-    // Transpose weights for matmul: (out, in) → (in, out)
-    let q_wt = transpose(&layer.q_weight, q_dim, d);
-    let k_wt = transpose(&layer.k_weight, kv_dim, d);
-    let v_wt = transpose(&layer.v_weight, kv_dim, d);
-
-    let mut q = build_matmul_cse(x, &q_wt, t, d, q_dim);
-    let mut k = build_matmul_cse(x, &k_wt, t, d, kv_dim);
-    let mut v = build_matmul_cse(x, &v_wt, t, d, kv_dim);
+    let mut q = build_matmul_cse_precomp(x, &layer.ln_q, t, d, q_dim);
+    let mut k = build_matmul_cse_precomp(x, &layer.ln_k, t, d, kv_dim);
+    let mut v = build_matmul_cse_precomp(x, &layer.ln_v, t, d, kv_dim);
 
     // Add bias (0-cost EML adds)
     for i in 0..t {
@@ -692,13 +714,8 @@ fn eml_gqa_attention(
         }
     }
 
-    // Output projection
-    let o_wt = transpose(&layer.o_weight, d, q_dim); // (q_dim, d) → (d, q_dim) wait...
-    // o_weight is (d_model, n_heads*d_head) in GGUF = (out, in)
-    // We need out @ o_weight^T = (T, n_heads*d_head) @ (n_heads*d_head, d_model)
-    let o_wt2 = transpose(&layer.o_weight, d, q_dim);
-    // o_weight: (d_model, q_dim) → transpose → (q_dim, d_model)
-    build_matmul_cse(&out, &o_wt2, t, q_dim, d)
+    // Output projection — use precomputed ln(o_weight)
+    build_matmul_cse_precomp(&out, &layer.ln_o, t, q_dim, d)
 }
 
 fn transpose(data: &[f64], rows: usize, cols: usize) -> Vec<f64> {
@@ -722,13 +739,9 @@ fn eml_swiglu_ffn(
     let d = cfg.d_model;
     let d_ff = cfg.d_ff;
 
-    // gate and up projections: x @ W^T
-    // gate_weight, up_weight: (d_ff, d_model) in GGUF → transpose to (d_model, d_ff)
-    let gate_wt = transpose(&layer.gate_weight, d_ff, d);
-    let up_wt = transpose(&layer.up_weight, d_ff, d);
-
-    let gate = build_matmul_cse(x, &gate_wt, t, d, d_ff);
-    let up = build_matmul_cse(x, &up_wt, t, d, d_ff);
+    // gate and up projections: use precomputed ln(W)
+    let gate = build_matmul_cse_precomp(x, &layer.ln_gate, t, d, d_ff);
+    let up = build_matmul_cse_precomp(x, &layer.ln_up, t, d, d_ff);
 
     // SwiGLU: silu(gate) * up
     let gate_activated = eml_silu(&gate);
@@ -736,10 +749,8 @@ fn eml_swiglu_ffn(
     // Element-wise mul via EML
     let hidden = eml_mul_vec(&gate_activated, &up);
 
-    // Down projection
-    let down_wt = transpose(&layer.down_weight, d, d_ff);
-    // down_weight: (d_model, d_ff) → transpose → (d_ff, d_model)
-    build_matmul_cse(&hidden, &down_wt, t, d_ff, d)
+    // Down projection — use precomputed ln(down_weight)
+    build_matmul_cse_precomp(&hidden, &layer.ln_down, t, d_ff, d)
 }
 
 // ─── Generation ─────────────────────────────────────────────────────────────

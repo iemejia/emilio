@@ -406,31 +406,211 @@ pub fn build_matmul_cse(
 ) -> Vec<f64> {
     use rayon::prelude::*;
 
-    // Precompute ln(A[i,k]) as full Complex64 — ln(negative) = ln|x| + iπ
-    // Taking only .re would lose the sign!
+    // Phase 1: ln(A) — complex to track sign (ln(negative) = ln|x| + iπ)
     let ln_a: Vec<Complex64> = a.par_iter()
         .map(|&v| Complex64::new(v, 0.0).ln())
         .collect();
 
-    // Precompute ln(B[k,j]) as full Complex64
+    // Phase 2: ln(B) and transpose to (cols, inner) for cache-friendly k-loop
+    let ln_b_raw: Vec<Complex64> = b.par_iter()
+        .map(|&v| Complex64::new(v, 0.0).ln())
+        .collect();
+    // Parallel transpose: each j-column written independently
+    let mut ln_b_t = vec![Complex64::new(0.0, 0.0); inner * cols];
+    ln_b_t.par_chunks_mut(inner).enumerate().for_each(|(j, chunk)| {
+        for k in 0..inner {
+            chunk[k] = ln_b_raw[k * cols + j];
+        }
+    });
+
+    // Phase 3: C[i,j] = Σ_k exp(ln_A[i,k] + ln_B_T[j,k])
+    // Real-exp bypass: since ln(real).im ∈ {0, π}, sum.im is always kπ.
+    // Use f64::exp(re) + branchless sign. No atomic counters.
+    let mut result = vec![0.0f64; rows * cols];
+    let use_parallel = cols >= 64 && inner >= 64;
+
+    if use_parallel {
+        for i in 0..rows {
+            let a_off = i * inner;
+            let row_slice = &mut result[i * cols..(i + 1) * cols];
+            row_slice.par_iter_mut().enumerate().for_each(|(j, out)| {
+                let b_off = j * inner;
+                let mut acc0 = 0.0f64;
+                let mut acc1 = 0.0f64;
+                let mut acc2 = 0.0f64;
+                let mut acc3 = 0.0f64;
+                let chunks = inner / 4;
+                let remainder = inner % 4;
+                for c in 0..chunks {
+                    let k = c * 4;
+                    let la0 = ln_a[a_off + k];
+                    let la1 = ln_a[a_off + k + 1];
+                    let la2 = ln_a[a_off + k + 2];
+                    let la3 = ln_a[a_off + k + 3];
+                    let lb0 = ln_b_t[b_off + k];
+                    let lb1 = ln_b_t[b_off + k + 1];
+                    let lb2 = ln_b_t[b_off + k + 2];
+                    let lb3 = ln_b_t[b_off + k + 3];
+                    // Branchless real-exp-signed
+                    let e0 = (la0.re + lb0.re).exp();
+                    let n0 = ((la0.im + lb0.im) * std::f64::consts::FRAC_1_PI).round() as i64;
+                    acc0 += e0 * (1.0 - 2.0 * (n0 & 1) as f64);
+                    let e1 = (la1.re + lb1.re).exp();
+                    let n1 = ((la1.im + lb1.im) * std::f64::consts::FRAC_1_PI).round() as i64;
+                    acc1 += e1 * (1.0 - 2.0 * (n1 & 1) as f64);
+                    let e2 = (la2.re + lb2.re).exp();
+                    let n2 = ((la2.im + lb2.im) * std::f64::consts::FRAC_1_PI).round() as i64;
+                    acc2 += e2 * (1.0 - 2.0 * (n2 & 1) as f64);
+                    let e3 = (la3.re + lb3.re).exp();
+                    let n3 = ((la3.im + lb3.im) * std::f64::consts::FRAC_1_PI).round() as i64;
+                    acc3 += e3 * (1.0 - 2.0 * (n3 & 1) as f64);
+                }
+                for k in (chunks * 4)..(chunks * 4 + remainder) {
+                    let re = ln_a[a_off + k].re + ln_b_t[b_off + k].re;
+                    let im = ln_a[a_off + k].im + ln_b_t[b_off + k].im;
+                    let e = re.exp();
+                    let n = (im * std::f64::consts::FRAC_1_PI).round() as i64;
+                    acc0 += e * (1.0 - 2.0 * (n & 1) as f64);
+                }
+                *out = acc0 + acc1 + acc2 + acc3;
+            });
+        }
+    } else {
+        // Sequential fallback for small matrices
+        for i in 0..rows {
+            let a_off = i * inner;
+            for j in 0..cols {
+                let b_off = j * inner;
+                let mut acc = 0.0f64;
+                for k in 0..inner {
+                    let re = ln_a[a_off + k].re + ln_b_t[b_off + k].re;
+                    let im = ln_a[a_off + k].im + ln_b_t[b_off + k].im;
+                    let e = re.exp();
+                    let n = (im * std::f64::consts::FRAC_1_PI).round() as i64;
+                    acc += e * (1.0 - 2.0 * (n & 1) as f64);
+                }
+                result[i * cols + j] = acc;
+            }
+        }
+    }
+
+    result
+}
+
+/// Precompute ln(B) transposed for use with build_matmul_cse_precomp.
+///
+/// For weight matrices stored in GGUF as (out_dim, in_dim), the double-transpose
+/// (emilio's transpose + matmul's internal ln-transpose) cancels out.
+/// So: just apply element-wise ln() to weights in their ORIGINAL layout.
+///
+/// `b_original` is the weight in GGUF layout (out_dim, in_dim) = (cols, inner).
+/// Returns ln(B) in (cols, inner) layout — ready for the inner loop.
+pub fn precompute_ln_weight(b_original: &[f64]) -> Vec<Complex64> {
+    use rayon::prelude::*;
+    b_original.par_iter()
+        .map(|&v| Complex64::new(v, 0.0).ln())
+        .collect()
+}
+
+/// Like precompute_ln_weight but for weights that are already in (inner, cols)
+/// layout (e.g., output_weight after emilio's load-time transpose).
+/// Must transpose to (cols, inner) for the inner loop.
+pub fn precompute_ln_weight_transposed(b: &[f64], inner: usize, cols: usize) -> Vec<Complex64> {
+    use rayon::prelude::*;
     let ln_b: Vec<Complex64> = b.par_iter()
         .map(|&v| Complex64::new(v, 0.0).ln())
         .collect();
+    let mut ln_b_t = vec![Complex64::new(0.0, 0.0); inner * cols];
+    ln_b_t.par_chunks_mut(inner).enumerate().for_each(|(j, chunk)| {
+        for k in 0..inner {
+            chunk[k] = ln_b[k * cols + j];
+        }
+    });
+    ln_b_t
+}
 
-    // Now each C[i,j] = Σ_k exp(ln_A[i,k] + ln_B[k,j])
-    // Full complex arithmetic preserves signs through exp(iπ) = -1
-    (0..rows * cols)
-        .into_par_iter()
-        .map(|idx| {
-            let (i, j) = (idx / cols, idx % cols);
-            let mut acc = Complex64::new(0.0, 0.0);
-            for k in 0..inner {
-                let sum = ln_a[i * inner + k] + ln_b[k * cols + j];
-                acc += sum.exp();
+/// CSE matmul with precomputed ln(B) transposed.
+/// Skips ln(B) computation and transpose — only computes ln(A) per call.
+pub fn build_matmul_cse_precomp(
+    a: &[f64],
+    ln_b_t: &[Complex64],  // precomputed, (cols, inner) layout
+    rows: usize, inner: usize, cols: usize,
+) -> Vec<f64> {
+    use rayon::prelude::*;
+
+    // Phase 1 only: ln(A) — typically tiny (d_model=896 elements)
+    let ln_a: Vec<Complex64> = a.iter()
+        .map(|&v| Complex64::new(v, 0.0).ln())
+        .collect();
+
+    // Phase 3: real-exp bypass with rayon j-parallelism
+    let mut result = vec![0.0f64; rows * cols];
+    let use_parallel = cols >= 64 && inner >= 64;
+
+    if use_parallel {
+        for i in 0..rows {
+            let a_off = i * inner;
+            let row_slice = &mut result[i * cols..(i + 1) * cols];
+            row_slice.par_iter_mut().enumerate().for_each(|(j, out)| {
+                let b_off = j * inner;
+                let mut acc0 = 0.0f64;
+                let mut acc1 = 0.0f64;
+                let mut acc2 = 0.0f64;
+                let mut acc3 = 0.0f64;
+                let chunks = inner / 4;
+                let remainder = inner % 4;
+                for c in 0..chunks {
+                    let k = c * 4;
+                    let la0 = ln_a[a_off + k];
+                    let la1 = ln_a[a_off + k + 1];
+                    let la2 = ln_a[a_off + k + 2];
+                    let la3 = ln_a[a_off + k + 3];
+                    let lb0 = ln_b_t[b_off + k];
+                    let lb1 = ln_b_t[b_off + k + 1];
+                    let lb2 = ln_b_t[b_off + k + 2];
+                    let lb3 = ln_b_t[b_off + k + 3];
+                    let e0 = (la0.re + lb0.re).exp();
+                    let n0 = ((la0.im + lb0.im) * std::f64::consts::FRAC_1_PI).round() as i64;
+                    acc0 += e0 * (1.0 - 2.0 * (n0 & 1) as f64);
+                    let e1 = (la1.re + lb1.re).exp();
+                    let n1 = ((la1.im + lb1.im) * std::f64::consts::FRAC_1_PI).round() as i64;
+                    acc1 += e1 * (1.0 - 2.0 * (n1 & 1) as f64);
+                    let e2 = (la2.re + lb2.re).exp();
+                    let n2 = ((la2.im + lb2.im) * std::f64::consts::FRAC_1_PI).round() as i64;
+                    acc2 += e2 * (1.0 - 2.0 * (n2 & 1) as f64);
+                    let e3 = (la3.re + lb3.re).exp();
+                    let n3 = ((la3.im + lb3.im) * std::f64::consts::FRAC_1_PI).round() as i64;
+                    acc3 += e3 * (1.0 - 2.0 * (n3 & 1) as f64);
+                }
+                for k in (chunks * 4)..(chunks * 4 + remainder) {
+                    let re = ln_a[a_off + k].re + ln_b_t[b_off + k].re;
+                    let im = ln_a[a_off + k].im + ln_b_t[b_off + k].im;
+                    let e = re.exp();
+                    let n = (im * std::f64::consts::FRAC_1_PI).round() as i64;
+                    acc0 += e * (1.0 - 2.0 * (n & 1) as f64);
+                }
+                *out = acc0 + acc1 + acc2 + acc3;
+            });
+        }
+    } else {
+        for i in 0..rows {
+            let a_off = i * inner;
+            for j in 0..cols {
+                let b_off = j * inner;
+                let mut acc = 0.0f64;
+                for k in 0..inner {
+                    let re = ln_a[a_off + k].re + ln_b_t[b_off + k].re;
+                    let im = ln_a[a_off + k].im + ln_b_t[b_off + k].im;
+                    let e = re.exp();
+                    let n = (im * std::f64::consts::FRAC_1_PI).round() as i64;
+                    acc += e * (1.0 - 2.0 * (n & 1) as f64);
+                }
+                result[i * cols + j] = acc;
             }
-            acc.re
-        })
-        .collect()
+        }
+    }
+
+    result
 }
 
 /// CSE-optimized layer norm.
