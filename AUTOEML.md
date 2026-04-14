@@ -81,6 +81,9 @@ Matmul dominates. All optimization effort targeted the CSE matmul kernel.
 
 15 experiments were run. 7 were kept, 8 were reverted.
 
+Then 3 more book-driven experiments (15–17) were run, 2 kept, 1 reverted.
+**Total: 18 experiments, 9 kept, 9 reverted.**
+
 ### Kept (cumulative, in order applied)
 
 | # | Optimization | Latency (μs) | Δ from baseline | Key insight |
@@ -93,6 +96,8 @@ Matmul dominates. All optimization effort targeted the CSE matmul kernel.
 | 9 | 4-wide loop unroll | 4,065 | −76.4% | Independent accumulators for instruction-level parallelism |
 | 10 | Batched atomic counter | 3,995 | −76.8% | One atomic add per matmul instead of per element |
 | 11 | Branchless sign | 3,917 | −77.3% | `1.0 - 2.0*(n&1)` instead of if/else |
+| 16 | Rayon j-parallelism | ~710 | −95.9% | Work-stealing over 896 columns [Iverson APL] |
+| 17 | Zero-copy borrow + par_iter_mut | ~456 | −97.4% | Eliminate 12MB clone; write directly to result |
 
 ### Reverted
 
@@ -105,17 +110,21 @@ Matmul dominates. All optimization effort targeted the CSE matmul kernel.
 | 12 | Truncation vs round | ~3,921 | Noise — not worth the complexity |
 | 13 | 8-wide loop unroll | 4,235 | Register pressure on Apple Silicon ARM |
 | 14 | Pre-extracted re/sign arrays | 5,719 | 46% slower — 4-array cache pressure dominates |
+| 15 | Compact f64+u8 format | ~3,834 | No improvement — compute-bound on exp(), not memory-bound |
 
 ## Final Results
 
 Benchmark: `(1, 896) × (896, 896)` matmul with transposed precomputed weights.
 
-| Metric | Baseline | Final | Improvement |
-|--------|----------|-------|-------------|
-| **Latency** | 17,238 μs | **3,917 μs** | **4.4× faster** |
-| **Throughput** | 51,978 elem/s | **~225,000 elem/s** | **4.3× higher** |
-| **Transcendentals** | 1,606,528 | **803,712** | **50% reduction** |
-| **ln calls** | 803,712 | **896** | **99.9% reduction** |
+| Metric | Baseline | After Exp 11 | After Exp 17 | Total Improvement |
+|--------|----------|-------------|-------------|-------------------|
+| **Latency** | 17,238 μs | 3,917 μs | **~456 μs** | **37.8× faster** |
+| **Throughput** | 51,978 elem/s | ~225,000 elem/s | **~1,970,000 elem/s** | **37.9× higher** |
+| **Transcendentals** | 1,606,528 | 803,712 | **803,712** | **50% reduction** |
+| **ln calls** | 803,712 | 896 | **896** | **99.9% reduction** |
+
+At ~456 μs we are at the theoretical hardware limit:
+802,816 exp calls × ~4.7 ns / 8 cores ≈ 472 μs.
 
 All 11 verification tests pass. Correctness confirmed across all shapes and
 numerical edge cases.
@@ -138,9 +147,18 @@ numerical edge cases.
    Apple Silicon; 8-wide causes register spills and is 8% slower.
 
 5. **Diminishing returns at the loop level.** After exp 6, each remaining
-   improvement was single-digit percent. The next frontier requires algebraic
-   changes (reducing the number of exp calls per output element) or hardware
-   targeting (ANE, NEON intrinsics).
+   single-threaded improvement was single-digit percent.
+
+6. **Parallelism unlocked the next frontier** (exp 16–17). Rayon work-stealing
+   over the j dimension gave 5.3× on 8 cores. Eliminating the 12MB clone
+   (zero-copy borrow of precomputed weights) added another 1.5×. Combined:
+   ~8× over the single-threaded optimized kernel. Source: Iverson's APL model
+   of treating inner products as atomic parallel operations.
+
+7. **We hit the hardware wall.** At ~456 μs, latency matches the theoretical
+   minimum of 802,816 exp calls × 4.7 ns / 8 cores ≈ 472 μs. Further gains
+   require reducing exp call count (algebraic pruning of negligible terms) or
+   using approximate exp.
 
 ## Commit History
 

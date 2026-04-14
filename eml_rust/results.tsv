@@ -14,3 +14,6 @@ experiment	kernel_type	transcendentals	exp_calls	ln_calls	throughput	latency_us	
 12	matmul	803712	802816	896	-	~3921	PASS	REVERTED: truncation vs round — noise
 13	matmul	803712	802816	896	-	4235	PASS	REVERTED: 8-wide unroll — register pressure
 14	matmul	803712	802816	896	-	5719	PASS	REVERTED: pre-extracted re/sign — 46% slower
+15	matmul	803712	802816	896	-	~3834	PASS	REVERTED: compact f64+u8 format — no improvement (compute-bound, not memory-bound)
+16	matmul	803712	802816	896	~1270000	~710	PASS	KEPT: rayon j-parallelism — 5.3× speedup [Book: Iverson APL inner product]
+17	matmul	803712	802816	896	~1970000	~456	PASS	KEPT: zero-copy borrow + par_iter_mut — 1.56× over rayon [eliminates 12MB clone per call]

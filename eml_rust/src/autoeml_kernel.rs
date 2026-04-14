@@ -12,6 +12,7 @@
 
 use num_complex::Complex64;
 use std::sync::atomic::{AtomicU64, Ordering};
+use rayon::prelude::*;
 
 // ─── Transcendental counters ────────────────────────────────────────────────
 // These are the auditing mechanism.  bench.rs reads them to verify EML purity.
@@ -152,9 +153,10 @@ pub fn kernel_fn_with_ln_a(
     // Phase 2: ln(B[k,j]) — use precomputed if available, else compute.
     //          If precomputed.transposed, data is already in (cols, inner) layout.
     //          Otherwise, compute and transpose.
-    let ln_b_t: Vec<Complex64> = if !precomputed.data.is_empty() && precomputed.transposed {
-        // Already transposed at precompute time — zero-cost here
-        precomputed.data.clone()
+    let owned_ln_b_t: Vec<Complex64>;
+    let ln_b_t: &[Complex64] = if !precomputed.data.is_empty() && precomputed.transposed {
+        // Already transposed at precompute time — zero-copy borrow
+        &precomputed.data
     } else {
         let ln_b_raw: Vec<Complex64> = if !precomputed.data.is_empty() {
             precomputed.data.clone()
@@ -171,53 +173,96 @@ pub fn kernel_fn_with_ln_a(
                 t[j * inner + k] = ln_b_raw[k * cols + j];
             }
         }
-        t
+        owned_ln_b_t = t;
+        &owned_ln_b_t
     };
 
     // Phase 3: C[i,j] = Σ_k exp(ln_A[i,k] + ln_B_T[j,k])
-    //          Both ln_a[i*inner+k] and ln_b_t[j*inner+k] are now
-    //          sequential in the k-loop → cache-friendly.
-    //          Optimization: since all values are ln(real), imaginary parts
-    //          are 0 or π.  Use real-valued exp with sign from im/π parity.
-    //          4-wide unroll with independent accumulators for ILP.
-    //          Batch atomic counter: add total exp count once after loop.
+    //          Exp 17: Rayon-chunked parallelism over j dimension.
+    //          Each chunk processes ~cols/num_threads output columns.
+    //          ln_a (14KB) fits in L1, shared read-only across threads.
+    //          ln_b_t is partitioned — each thread streams its own portion.
+    //          Source: Iverson's APL inner product model — treat the whole
+    //          column-batch as a single fused operation dispatched to a core.
     let total_exp = (rows * inner * cols) as u64;
     EXP_CALLS.fetch_add(total_exp, Ordering::Relaxed);
 
     let mut result = vec![0.0f64; rows * cols];
-    for i in 0..rows {
-        let a_off = i * inner;
-        for j in 0..cols {
-            let b_off = j * inner;
-            let mut acc0 = 0.0f64;
-            let mut acc1 = 0.0f64;
-            let mut acc2 = 0.0f64;
-            let mut acc3 = 0.0f64;
-            let chunks = inner / 4;
-            let remainder = inner % 4;
-            for c in 0..chunks {
-                let k = c * 4;
-                let la0 = ln_a[a_off + k];
-                let la1 = ln_a[a_off + k + 1];
-                let la2 = ln_a[a_off + k + 2];
-                let la3 = ln_a[a_off + k + 3];
-                let lb0 = ln_b_t[b_off + k];
-                let lb1 = ln_b_t[b_off + k + 1];
-                let lb2 = ln_b_t[b_off + k + 2];
-                let lb3 = ln_b_t[b_off + k + 3];
-                acc0 += exp_real_signed(la0.re + lb0.re, la0.im + lb0.im);
-                acc1 += exp_real_signed(la1.re + lb1.re, la1.im + lb1.im);
-                acc2 += exp_real_signed(la2.re + lb2.re, la2.im + lb2.im);
-                acc3 += exp_real_signed(la3.re + lb3.re, la3.im + lb3.im);
+
+    // For small problems, avoid rayon overhead
+    let use_parallel = cols >= 64 && inner >= 64;
+
+    if use_parallel {
+        for i in 0..rows {
+            let a_off = i * inner;
+            let row_slice = &mut result[i * cols..(i + 1) * cols];
+            row_slice.par_iter_mut().enumerate().for_each(|(j, out)| {
+                let b_off = j * inner;
+                let mut acc0 = 0.0f64;
+                let mut acc1 = 0.0f64;
+                let mut acc2 = 0.0f64;
+                let mut acc3 = 0.0f64;
+                let chunks = inner / 4;
+                let remainder = inner % 4;
+                for c in 0..chunks {
+                    let k = c * 4;
+                    let la0 = ln_a[a_off + k];
+                    let la1 = ln_a[a_off + k + 1];
+                    let la2 = ln_a[a_off + k + 2];
+                    let la3 = ln_a[a_off + k + 3];
+                    let lb0 = ln_b_t[b_off + k];
+                    let lb1 = ln_b_t[b_off + k + 1];
+                    let lb2 = ln_b_t[b_off + k + 2];
+                    let lb3 = ln_b_t[b_off + k + 3];
+                    acc0 += exp_real_signed(la0.re + lb0.re, la0.im + lb0.im);
+                    acc1 += exp_real_signed(la1.re + lb1.re, la1.im + lb1.im);
+                    acc2 += exp_real_signed(la2.re + lb2.re, la2.im + lb2.im);
+                    acc3 += exp_real_signed(la3.re + lb3.re, la3.im + lb3.im);
+                }
+                for k in (chunks * 4)..(chunks * 4 + remainder) {
+                    acc0 += exp_real_signed(
+                        ln_a[a_off + k].re + ln_b_t[b_off + k].re,
+                        ln_a[a_off + k].im + ln_b_t[b_off + k].im,
+                    );
+                }
+                *out = acc0 + acc1 + acc2 + acc3;
+            });
+        }
+    } else {
+        // Sequential path for small problems
+        for i in 0..rows {
+            let a_off = i * inner;
+            for j in 0..cols {
+                let b_off = j * inner;
+                let mut acc0 = 0.0f64;
+                let mut acc1 = 0.0f64;
+                let mut acc2 = 0.0f64;
+                let mut acc3 = 0.0f64;
+                let chunks = inner / 4;
+                let remainder = inner % 4;
+                for c in 0..chunks {
+                    let k = c * 4;
+                    let la0 = ln_a[a_off + k];
+                    let la1 = ln_a[a_off + k + 1];
+                    let la2 = ln_a[a_off + k + 2];
+                    let la3 = ln_a[a_off + k + 3];
+                    let lb0 = ln_b_t[b_off + k];
+                    let lb1 = ln_b_t[b_off + k + 1];
+                    let lb2 = ln_b_t[b_off + k + 2];
+                    let lb3 = ln_b_t[b_off + k + 3];
+                    acc0 += exp_real_signed(la0.re + lb0.re, la0.im + lb0.im);
+                    acc1 += exp_real_signed(la1.re + lb1.re, la1.im + lb1.im);
+                    acc2 += exp_real_signed(la2.re + lb2.re, la2.im + lb2.im);
+                    acc3 += exp_real_signed(la3.re + lb3.re, la3.im + lb3.im);
+                }
+                for k in (chunks * 4)..(chunks * 4 + remainder) {
+                    acc0 += exp_real_signed(
+                        ln_a[a_off + k].re + ln_b_t[b_off + k].re,
+                        ln_a[a_off + k].im + ln_b_t[b_off + k].im,
+                    );
+                }
+                result[i * cols + j] = acc0 + acc1 + acc2 + acc3;
             }
-            // Remainder
-            for k in (chunks * 4)..(chunks * 4 + remainder) {
-                acc0 += exp_real_signed(
-                    ln_a[a_off + k].re + ln_b_t[b_off + k].re,
-                    ln_a[a_off + k].im + ln_b_t[b_off + k].im,
-                );
-            }
-            result[i * cols + j] = acc0 + acc1 + acc2 + acc3;
         }
     }
 
