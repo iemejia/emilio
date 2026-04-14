@@ -91,14 +91,14 @@ fn test_paper_identities() -> bool {
     // exp(x) = eml(x, 1)
     for &xv in &[0.0, 1.0, -1.0, 2.5] {
         let got = to_r(eml(to_c(xv), to_c(1.0)));
-        tc.check(&format!("exp({xv})"), got, xv.exp(), 1e-9);
+        tc.check(&format!("exp({xv})"), got, xv.exp(), 1e-9); // EML_AUDIT:OK — stdlib reference value for test oracle
     }
 
     // ln(x) = eml(1, eml(eml(1, x), 1))
     for &xv in &[0.5, 1.0, 2.0, std::f64::consts::E] {
         let one = to_c(1.0);
         let got = to_r(eml(one, eml(eml(one, to_c(xv)), one)));
-        tc.check(&format!("ln({xv:.4})"), got, xv.ln(), 1e-9);
+        tc.check(&format!("ln({xv:.4})"), got, xv.ln(), 1e-9); // EML_AUDIT:OK — stdlib reference value for test oracle
     }
 
     // e = eml(1, 1)
@@ -125,12 +125,12 @@ fn test_derived_ops() -> bool {
 
     // exp
     for &x in &[0.0, 1.0, -0.5, 2.0] {
-        tc.check(&format!("eml_exp({x})"), to_r(eml_exp(to_c(x))), x.exp(), 1e-6);
+        tc.check(&format!("eml_exp({x})"), to_r(eml_exp(to_c(x))), x.exp(), 1e-6); // EML_AUDIT:OK — stdlib reference value for test oracle
     }
 
     // ln
     for &x in &[0.1, 1.0, 2.0, 10.0] {
-        tc.check(&format!("eml_ln({x})"), to_r(eml_ln(to_c(x))), x.ln(), 1e-6);
+        tc.check(&format!("eml_ln({x})"), to_r(eml_ln(to_c(x))), x.ln(), 1e-6); // EML_AUDIT:OK — stdlib reference value for test oracle
     }
 
     // sqrt
@@ -176,7 +176,7 @@ fn test_derived_ops() -> bool {
     // softmax
     let x = [1.0, 2.0, 3.0, 4.0];
     let max_x = 4.0_f64;
-    let ref_exp: Vec<f64> = x.iter().map(|&v| (v - max_x).exp()).collect();
+    let ref_exp: Vec<f64> = x.iter().map(|&v| (v - max_x).exp()).collect(); // EML_AUDIT:OK — stdlib reference value for test oracle
     let ref_sum: f64 = ref_exp.iter().sum();
     let ref_sm: Vec<f64> = ref_exp.iter().map(|&e| e / ref_sum).collect();
     let got = eml_softmax(&x);

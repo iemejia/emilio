@@ -1,28 +1,48 @@
 //! emilio — EML inference engine
 //!
-//! Usage: emilio <model.gguf> [--explore | --generate <text> | --chat <message>]
+//! Usage:
+//!   emilio <model.gguf|model.eml> [--explore | --generate <text> | --chat <message>]
+//!   emilio <model.gguf> --compile [output.eml]       (v1 format)
+//!   emilio <model.gguf> --compile-v2 [output.eml]    (v2: sign+mag, fused, pruned)
+//!   emilio <model.gguf> --generate --gpu "text"       (Metal GPU acceleration)
 
 use eml_rust_core::gguf::GGUFFile;
 use eml_rust_core::emilio::*;
+use eml_rust_core::eml_format;
+use eml_rust_core::eml_v2::{self as v2, v2_generate};
 use eml_rust_core::tokenizer::Tokenizer;
 use std::time::Instant;
+#[cfg(feature = "metal")]
+use eml_rust_core::metal_eml::{MetalContext, GpuModelWeights, ScratchPool};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: emilio <model.gguf> [--explore | --generate <text> | --chat <message>]");
+        eprintln!("Usage: emilio <model.gguf|model.eml> [--explore | --generate <text> | --compile-v2 [out.eml]]");
         eprintln!();
         eprintln!("Examples:");
         eprintln!("  emilio model.gguf --explore");
         eprintln!("  emilio model.gguf --generate \"Hello world\"");
         eprintln!("  emilio model.gguf --chat \"What is 2+2?\"");
         eprintln!("  emilio model.gguf --tokens \"1,2,3\"     (raw token IDs)");
+        eprintln!("  emilio model.gguf --compile              (v1: writes model.eml)");
+        eprintln!("  emilio model.gguf --compile-v2            (v2: sign+mag + fused + pruned)");
+        eprintln!("  emilio model.eml  --generate \"Hello\"     (load compiled, auto-detect v1/v2)");
+        #[cfg(feature = "metal")]
+        eprintln!("  emilio model.gguf --generate --gpu \"Hello\" (Metal GPU acceleration)");
         std::process::exit(1);
     }
 
-    let model_path = &args[1];
-    let mode = args.get(2).map(|s| s.as_str()).unwrap_or("--explore");
+    // Check for --gpu flag anywhere in args
+    let use_gpu = args.iter().any(|a| a == "--gpu");
+    let args_filtered: Vec<String> = args.iter()
+        .filter(|a| a.as_str() != "--gpu")
+        .cloned()
+        .collect();
+
+    let model_path = &args_filtered[1];
+    let mode = args_filtered.get(2).map(|s| s.as_str()).unwrap_or("--explore");
 
     println!();
     println!("╔══════════════════════════════════════════════════════════╗");
@@ -31,6 +51,179 @@ fn main() {
     println!("╚══════════════════════════════════════════════════════════╝");
     println!();
 
+    // ── Detect model format ────────────────────────────────────────
+    #[cfg(not(feature = "metal"))]
+    if use_gpu {
+        eprintln!("Error: --gpu requires the 'metal' feature. Build with: cargo build --features metal");
+        std::process::exit(1);
+    }
+
+    if eml_format::is_eml_file(model_path) {
+        // .eml compiled format — auto-detect v1 vs v2
+        match eml_format::detect_eml_version(model_path) {
+            Ok(1) => run_from_eml(model_path, mode, &args),
+            Ok(2) => run_from_eml_v2(model_path, mode, &args),
+            Ok(v) => {
+                eprintln!("Unsupported EML version: {v}");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error reading .eml: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        // GGUF format — original path
+        run_from_gguf(model_path, mode, &args_filtered, use_gpu);
+    }
+}
+
+fn run_from_eml(model_path: &str, mode: &str, args: &[String]) {
+    println!("Loading compiled EML: {model_path}");
+    let t0 = Instant::now();
+    let (weights, tokenizer) = match eml_format::load_eml(model_path) {
+        Ok(wt) => wt,
+        Err(e) => {
+            eprintln!("Error loading .eml: {e}");
+            std::process::exit(1);
+        }
+    };
+    let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    println!("  Loaded in {load_ms:.0}ms ({} layers, vocab {})",
+        weights.config.n_layers, weights.config.vocab_size);
+    println!("  Tokenizer: {} tokens, {} merges",
+        tokenizer.vocab_size(), tokenizer.merges.len());
+    println!();
+
+    match mode {
+        "--generate" => {
+            let text = args.get(3).map(|s| s.as_str()).unwrap_or("Hello");
+            let prompt_ids = tokenizer.encode(text);
+            println!("  Tokenized: \"{}\" → {} tokens: {:?}",
+                text, prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(20)]);
+            generate_with_weights(&weights, &prompt_ids, &tokenizer);
+        }
+        "--chat" => {
+            let msg = args.get(3).map(|s| s.as_str()).unwrap_or("Hello");
+            let prompt_ids = tokenizer.encode_chat(msg);
+            println!("  Chat prompt: \"{msg}\"");
+            println!("  Tokenized to {} tokens: {:?}...",
+                prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(20)]);
+            generate_with_weights(&weights, &prompt_ids, &tokenizer);
+        }
+        "--tokens" => {
+            let tok_str = args.get(3).map(|s| s.as_str()).unwrap_or("1,2,3");
+            let prompt: Vec<usize> = tok_str
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            generate_raw_with_weights(&weights, &prompt, Some(&tokenizer));
+        }
+        _ => {
+            eprintln!("Unknown mode for .eml: {mode} (use --generate, --chat, or --tokens)");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_from_eml_v2(model_path: &str, mode: &str, args: &[String]) {
+    println!("Loading compiled EML v2: {model_path}");
+    let t0 = Instant::now();
+    let (weights, tokenizer) = match eml_format::load_eml_v2(model_path) {
+        Ok(wt) => wt,
+        Err(e) => {
+            eprintln!("Error loading .eml v2: {e}");
+            std::process::exit(1);
+        }
+    };
+    let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    println!("  Loaded in {load_ms:.0}ms ({} layers, vocab {})",
+        weights.config.n_layers, weights.config.vocab_size);
+    println!("  Format: v2 (sign+mag, fused QKV + gate_up, pruned)");
+    println!("  Sparsity: {}/{} params pruned ({:.1}%, threshold={:.0})",
+        weights.sparsity.pruned_params, weights.sparsity.total_params,
+        100.0 * weights.sparsity.pruned_params as f64 / weights.sparsity.total_params.max(1) as f64,
+        weights.sparsity.threshold);
+    println!("  Exec graph: {} ops", weights.exec_graph.len());
+    println!("  Tokenizer: {} tokens, {} merges",
+        tokenizer.vocab_size(), tokenizer.merges.len());
+    println!();
+
+    let rope = RopeCache::new(
+        weights.config.d_head,
+        weights.config.max_seq_len.min(2048),
+        weights.config.rope_freq_base,
+    );
+
+    match mode {
+        "--generate" => {
+            let text = args.get(3).map(|s| s.as_str()).unwrap_or("Hello");
+            let prompt_ids = tokenizer.encode(text);
+            println!("  Tokenized: \"{}\" → {} tokens: {:?}",
+                text, prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(20)]);
+
+            println!();
+            println!("Running emilio v2 (sign+mag, fused ops, compiled format)...");
+            println!("  Prompt: {} tokens", prompt_ids.len());
+            println!("  Config: {} layers, {} heads, d_model={}",
+                weights.config.n_layers, weights.config.n_heads, weights.config.d_model);
+
+            let max_new = 16;
+            let t1 = Instant::now();
+            let output = v2_generate(&prompt_ids, &weights, &rope, max_new);
+            let gen_s = t1.elapsed().as_secs_f64();
+
+            let generated = &output[prompt_ids.len()..];
+            let prompt_text = tokenizer.decode(&prompt_ids);
+            let generated_text = tokenizer.decode(generated);
+
+            println!();
+            println!("  ┌─────────────────────────────────────────────────");
+            println!("  │ Prompt:    \"{}\"", prompt_text);
+            println!("  │ Generated: \"{}\"", generated_text);
+            println!("  │ Token IDs: {:?}", generated);
+            println!("  └─────────────────────────────────────────────────");
+            println!("  Time:      {gen_s:.2}s ({:.4} tokens/s)",
+                generated.len() as f64 / gen_s);
+            println!();
+            println!("  v2: sign+mag kernel, fused QKV/gate_up, {:.1}% pruned.",
+                100.0 * weights.sparsity.pruned_params as f64 / weights.sparsity.total_params.max(1) as f64);
+        }
+        "--chat" => {
+            let msg = args.get(3).map(|s| s.as_str()).unwrap_or("Hello");
+            let prompt_ids = tokenizer.encode_chat(msg);
+            println!("  Chat prompt: \"{msg}\"");
+            println!("  Tokenized to {} tokens: {:?}...",
+                prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(20)]);
+
+            println!();
+            println!("Running emilio v2 (sign+mag, fused ops, compiled format)...");
+
+            let max_new = 16;
+            let t1 = Instant::now();
+            let output = v2_generate(&prompt_ids, &weights, &rope, max_new);
+            let gen_s = t1.elapsed().as_secs_f64();
+
+            let generated = &output[prompt_ids.len()..];
+            let generated_text = tokenizer.decode(generated);
+
+            println!();
+            println!("  ┌─────────────────────────────────────────────────");
+            println!("  │ Prompt:    \"{msg}\"");
+            println!("  │ Generated: \"{}\"", generated_text);
+            println!("  │ Token IDs: {:?}", generated);
+            println!("  └─────────────────────────────────────────────────");
+            println!("  Time:      {gen_s:.2}s ({:.4} tokens/s)",
+                generated.len() as f64 / gen_s);
+        }
+        _ => {
+            eprintln!("Unknown mode for .eml v2: {mode} (use --generate or --chat)");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_from_gguf(model_path: &str, mode: &str, args: &[String], use_gpu: bool) {
     // ── Parse GGUF ─────────────────────────────────────────────────
     println!("Loading GGUF: {model_path}");
     let t0 = Instant::now();
@@ -53,12 +246,32 @@ fn main() {
 
     match mode {
         "--explore" => explore(&gguf),
+        "--compile" => {
+            let tok = tokenizer.as_ref().expect("Tokenizer not found in GGUF");
+            let out_path = args.get(3).map(|s| s.as_str()).unwrap_or_else(|| {
+                // Default: replace .gguf with .eml
+                Box::leak(model_path.replace(".gguf", ".eml").into_boxed_str())
+            });
+            compile_model(&gguf, tok, out_path);
+        }
+        "--compile-v2" => {
+            let tok = tokenizer.as_ref().expect("Tokenizer not found in GGUF");
+            let out_path = args.get(3).map(|s| s.as_str()).unwrap_or_else(|| {
+                Box::leak(model_path.replace(".gguf", ".eml").into_boxed_str())
+            });
+            compile_model_v2(&gguf, tok, out_path);
+        }
         "--generate" => {
             let text = args.get(3).map(|s| s.as_str()).unwrap_or("Hello");
             let tok = tokenizer.as_ref().expect("Tokenizer not found in GGUF");
             let prompt_ids = tok.encode(text);
             println!("  Tokenized: \"{}\" → {} tokens: {:?}",
                 text, prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(20)]);
+            #[cfg(feature = "metal")]
+            if use_gpu {
+                generate_metal(&gguf, &prompt_ids, tok);
+                return;
+            }
             generate(&gguf, &prompt_ids, tok);
         }
         "--chat" => {
@@ -68,6 +281,11 @@ fn main() {
             println!("  Chat prompt: \"{msg}\"");
             println!("  Tokenized to {} tokens: {:?}...",
                 prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(20)]);
+            #[cfg(feature = "metal")]
+            if use_gpu {
+                generate_metal(&gguf, &prompt_ids, tok);
+                return;
+            }
             generate(&gguf, &prompt_ids, tok);
         }
         "--tokens" => {
@@ -84,6 +302,108 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn compile_model(gguf: &GGUFFile, tok: &Tokenizer, out_path: &str) {
+    println!("Compiling model to EML format...");
+
+    let t0 = Instant::now();
+    let weights = match ModelWeights::from_gguf(gguf) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("Error loading weights: {e}");
+            std::process::exit(1);
+        }
+    };
+    let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    println!("  Dequantized + precomputed ln(W) in {load_ms:.0}ms");
+
+    let t1 = Instant::now();
+    match eml_format::compile_to_eml(&weights, tok, out_path) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("Error writing .eml: {e}");
+            std::process::exit(1);
+        }
+    }
+    let write_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+    let file_size = std::fs::metadata(out_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    println!("  Wrote {out_path} ({:.1} MB) in {write_ms:.0}ms",
+        file_size as f64 / 1_048_576.0);
+    println!();
+    println!("  Format: EML v1 (precomputed ln(W) as Complex64)");
+    println!("  Contents:");
+    println!("    - Config ({} layers, d_model={}, vocab={})",
+        weights.config.n_layers, weights.config.d_model, weights.config.vocab_size);
+    println!("    - Tokenizer ({} tokens, {} merges)",
+        tok.vocab_size(), tok.merges.len());
+    println!("    - {} precomputed ln(W) tensors (Complex64)",
+        weights.config.n_layers * 7 + 1);
+    println!("    - {} bias/norm tensors (f64)",
+        weights.config.n_layers * 5 + 2);
+    println!();
+    println!("  To use: emilio {out_path} --generate \"Hello world\"");
+}
+
+fn compile_model_v2(gguf: &GGUFFile, tok: &Tokenizer, out_path: &str) {
+    println!("Compiling model to EML v2 format (sign+mag, fused, pruned)...");
+
+    // Step 1: Load GGUF → v1 ModelWeights (dequant + precompute ln)
+    let t0 = Instant::now();
+    let weights = match ModelWeights::from_gguf(gguf) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("Error loading weights: {e}");
+            std::process::exit(1);
+        }
+    };
+    let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    println!("  Dequantized + precomputed ln(W) in {load_ms:.0}ms");
+
+    // Step 2: Compile v1 → v2 (fusion + sign+mag + pruning)
+    let t1 = Instant::now();
+    println!("  Compiling v2 (fusing QKV + gate_up, sign+mag encoding, pruning)...");
+    let v2 = v2::compile_v2(&weights, v2::DEFAULT_PRUNE_THRESHOLD);
+    let compile_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    println!("  Compiled v2 in {compile_ms:.0}ms");
+    println!("    Sparsity: {}/{} params pruned ({:.2}%, threshold={:.0})",
+        v2.sparsity.pruned_params, v2.sparsity.total_params,
+        100.0 * v2.sparsity.pruned_params as f64 / v2.sparsity.total_params.max(1) as f64,
+        v2.sparsity.threshold);
+    println!("    Exec graph: {} ops", v2.exec_graph.len());
+
+    // Step 3: Serialize to .eml v2
+    let t2 = Instant::now();
+    match eml_format::compile_to_eml_v2(&v2, tok, out_path) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("Error writing .eml v2: {e}");
+            std::process::exit(1);
+        }
+    }
+    let write_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+    let file_size = std::fs::metadata(out_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    println!("  Wrote {out_path} ({:.1} MB) in {write_ms:.0}ms",
+        file_size as f64 / 1_048_576.0);
+    println!();
+    println!("  Format: EML v2");
+    println!("  Optimizations:");
+    println!("    1. Sign+magnitude: 8.125 bytes/elem vs 16 (~50% file reduction)");
+    println!("    2. Fused QKV: 3 matmuls → 1 (shared ln(activation))");
+    println!("    3. Fused gate+up: 2 matmuls → 1 (shared ln(activation))");
+    println!("    4. Sparse pruning: {:.1}% of weights pruned",
+        100.0 * v2.sparsity.pruned_params as f64 / v2.sparsity.total_params.max(1) as f64);
+    println!("    5. Execution graph: {} ops stored", v2.exec_graph.len());
+    println!();
+    println!("  To use: emilio {out_path} --generate \"Hello world\"");
 }
 
 fn explore(gguf: &GGUFFile) {
@@ -269,4 +589,139 @@ fn generate_raw(gguf: &GGUFFile, prompt: &[usize], tok: Option<&Tokenizer>) {
     }
     println!("  Time: {gen_s:.2}s ({:.4} tokens/s)",
         generated.len() as f64 / gen_s);
+}
+
+fn generate_with_weights(weights: &ModelWeights, prompt: &[usize], tok: &Tokenizer) {
+    let rope = RopeCache::new(
+        weights.config.d_head,
+        weights.config.max_seq_len.min(2048),
+        weights.config.rope_freq_base,
+    );
+
+    println!();
+    println!("Running emilio (pure EML inference, KV-cached, compiled format)...");
+    println!("  Prompt: {} tokens", prompt.len());
+    println!("  Config: {} layers, {} heads, d_model={}",
+        weights.config.n_layers, weights.config.n_heads, weights.config.d_model);
+
+    let max_new = 16;
+    let t1 = Instant::now();
+    let output = emilio_generate(prompt, weights, &rope, max_new);
+    let gen_s = t1.elapsed().as_secs_f64();
+
+    let generated = &output[prompt.len()..];
+    let prompt_text = tok.decode(prompt);
+    let generated_text = tok.decode(generated);
+
+    println!();
+    println!("  ┌─────────────────────────────────────────────────");
+    println!("  │ Prompt:    \"{}\"", prompt_text);
+    println!("  │ Generated: \"{}\"", generated_text);
+    println!("  │ Token IDs: {:?}", generated);
+    println!("  └─────────────────────────────────────────────────");
+    println!("  Time:      {gen_s:.2}s ({:.4} tokens/s)",
+        generated.len() as f64 / gen_s);
+    println!();
+    println!("  Every multiply was exp(ln(a) + ln(b)).");
+    println!("  Every division was exp(ln(a) - ln(b)).");
+}
+
+fn generate_raw_with_weights(weights: &ModelWeights, prompt: &[usize], tok: Option<&Tokenizer>) {
+    let rope = RopeCache::new(
+        weights.config.d_head,
+        weights.config.max_seq_len.min(2048),
+        weights.config.rope_freq_base,
+    );
+
+    println!();
+    println!("Running emilio (pure EML, KV-cached, compiled format)...");
+    println!("  Prompt token IDs: {:?}", prompt);
+
+    let max_new = 8;
+    let t1 = Instant::now();
+    let output = emilio_generate(prompt, weights, &rope, max_new);
+    let gen_s = t1.elapsed().as_secs_f64();
+
+    let generated = &output[prompt.len()..];
+    println!();
+    println!("  Generated IDs: {:?}", generated);
+    if let Some(tok) = tok {
+        println!("  Decoded: \"{}\"", tok.decode(generated));
+    }
+    println!("  Time: {gen_s:.2}s ({:.4} tokens/s)",
+        generated.len() as f64 / gen_s);
+}
+
+#[cfg(feature = "metal")]
+fn generate_metal(gguf: &GGUFFile, prompt: &[usize], tok: &Tokenizer) {
+    println!("Loading model weights...");
+    let t0 = Instant::now();
+    let weights = match ModelWeights::from_gguf(gguf) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("Error loading weights: {e}");
+            std::process::exit(1);
+        }
+    };
+    let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    println!("  Weights loaded in {load_ms:.0}ms");
+
+    // Initialize Metal GPU
+    println!();
+    println!("Initializing Metal GPU...");
+    let t_gpu = Instant::now();
+    let ctx = match MetalContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Metal init failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Upload all weight matrices to GPU
+    let gpu_w = GpuModelWeights::from_model_weights(&ctx, &weights);
+
+    // Pre-allocate scratch buffers (eliminates per-call allocations)
+    let max_act = weights.config.d_model.max(weights.config.d_ff);
+    let max_result = weights.config.vocab_size.max(weights.config.d_ff);
+    let pool = ScratchPool::new(&ctx, max_act, max_result);
+
+    let gpu_ms = t_gpu.elapsed().as_secs_f64() * 1000.0;
+    println!("  GPU ready in {gpu_ms:.0}ms");
+
+    let rope = RopeCache::new(
+        weights.config.d_head,
+        weights.config.max_seq_len.min(2048),
+        weights.config.rope_freq_base,
+    );
+
+    println!();
+    println!("Running emilio (Metal GPU, pure EML inference)...");
+    println!("  Prompt: {} tokens", prompt.len());
+    println!("  Config: {} layers, {} heads, d_model={}",
+        weights.config.n_layers, weights.config.n_heads, weights.config.d_model);
+    println!("  Backend: Metal GPU (float32 exp kernel)");
+
+    let max_new = 16;
+    let t1 = Instant::now();
+    let output = eml_rust_core::emilio::gpu::generate_gpu(
+        prompt, &weights, &gpu_w, &ctx, &pool, &rope, max_new,
+    );
+    let gen_s = t1.elapsed().as_secs_f64();
+
+    let generated = &output[prompt.len()..];
+    let prompt_text = tok.decode(prompt);
+    let generated_text = tok.decode(generated);
+
+    println!();
+    println!("  ┌─────────────────────────────────────────────────");
+    println!("  │ Prompt:    \"{}\"", prompt_text);
+    println!("  │ Generated: \"{}\"", generated_text);
+    println!("  │ Token IDs: {:?}", generated);
+    println!("  └─────────────────────────────────────────────────");
+    println!("  Time:      {gen_s:.2}s ({:.4} tokens/s)",
+        generated.len() as f64 / gen_s);
+    println!();
+    println!("  Metal GPU: exp() kernel on GPU, ln()/norm/RoPE on CPU.");
+    println!("  Every multiply was exp(ln(a) + ln(b)) — on the GPU.");
 }

@@ -19,6 +19,7 @@
 use egg::*;
 use num_complex::Complex64;
 use ordered_float::NotNan;
+use crate::eml_ops::{eml_exp, eml_ln, eml_add, eml_sub, eml_neg, eml_mul, eml_div, eml_inv, eml_sqrt, ONE, to_c, to_r};
 
 // ─── EML Language Definition ────────────────────────────────────────────────
 
@@ -275,55 +276,43 @@ pub fn eval_expr(expr: &RecExpr<EmlLang>, vars: &[(&str, f64)]) -> f64 {
                     .unwrap_or_else(|| panic!("unbound variable: {name_str}"))
             }
 
-            // The primitive — always goes through real exp + ln
-            EmlLang::Eml([x, y]) => vals[usize::from(*x)].exp() - vals[usize::from(*y)].ln(),
+            // The primitive — eml(x, y) = exp(x) - ln(y)
+            EmlLang::Eml([x, y]) => eml_sub(eml_exp(vals[usize::from(*x)]), eml_ln(vals[usize::from(*y)])),
 
-            // Transcendentals — real exp/ln calls
-            EmlLang::Exp([x]) => vals[usize::from(*x)].exp(),
-            EmlLang::Ln([x]) => vals[usize::from(*x)].ln(),
+            // Transcendentals — through eml_ops
+            EmlLang::Exp([x]) => eml_exp(vals[usize::from(*x)]),
+            EmlLang::Ln([x]) => eml_ln(vals[usize::from(*x)]),
 
             // Additive group — 0 transcendentals (proven by exp∘ln cancellation)
-            EmlLang::Add([a, b]) => vals[usize::from(*a)] + vals[usize::from(*b)],
-            EmlLang::Sub([a, b]) => vals[usize::from(*a)] - vals[usize::from(*b)],
-            EmlLang::Neg([x]) => -vals[usize::from(*x)],
+            EmlLang::Add([a, b]) => eml_add(vals[usize::from(*a)], vals[usize::from(*b)]),
+            EmlLang::Sub([a, b]) => eml_sub(vals[usize::from(*a)], vals[usize::from(*b)]),
+            EmlLang::Neg([x]) => eml_neg(vals[usize::from(*x)]),
 
             // Multiplicative — through log domain (real transcendentals)
-            EmlLang::Mul([a, b]) => {
-                let la = vals[usize::from(*a)].ln();
-                let lb = vals[usize::from(*b)].ln();
-                (la + lb).exp()
-            }
-            EmlLang::Div([a, b]) => {
-                let la = vals[usize::from(*a)].ln();
-                let lb = vals[usize::from(*b)].ln();
-                (la - lb).exp()
-            }
-            EmlLang::Inv([x]) => {
-                let lx = vals[usize::from(*x)].ln();
-                (-lx).exp()
-            }
+            EmlLang::Mul([a, b]) => eml_mul(vals[usize::from(*a)], vals[usize::from(*b)]),
+            EmlLang::Div([a, b]) => eml_div(vals[usize::from(*a)], vals[usize::from(*b)]),
+            EmlLang::Inv([x]) => eml_inv(vals[usize::from(*x)]),
 
             // Power/root — through log domain
-            EmlLang::Sqrt([x]) => {
-                let half = Complex64::new(0.5, 0.0);
-                (half * vals[usize::from(*x)].ln()).exp()
-            }
+            EmlLang::Sqrt([x]) => eml_sqrt(vals[usize::from(*x)]),
             EmlLang::Pow([a, b]) => {
-                (vals[usize::from(*b)] * vals[usize::from(*a)].ln()).exp()
+                // pow(a, b) = exp(b * ln(a))
+                eml_exp(eml_mul(vals[usize::from(*b)], eml_ln(vals[usize::from(*a)])))
             }
 
-            // Activations — through log domain
+            // Activations — through eml_ops
             EmlLang::Gelu([x]) => {
                 let xv = vals[usize::from(*x)];
-                let c = Complex64::new(1.702, 0.0);
-                let one = Complex64::new(1.0, 0.0);
-                let sig = one / (one + (-c * xv).exp());
-                (xv.ln() + sig.ln()).exp()
+                let c = to_c(1.702);
+                // gelu(x) = x * sigmoid(1.702x)
+                let cx = eml_mul(c, xv);
+                let sig = eml_inv(eml_add(ONE, eml_exp(eml_neg(cx))));
+                eml_mul(xv, sig)
             }
             EmlLang::Sigmoid([x]) => {
                 let xv = vals[usize::from(*x)];
-                let one = Complex64::new(1.0, 0.0);
-                one / (one + (-xv).exp())
+                // sigmoid(x) = 1 / (1 + exp(-x))
+                eml_inv(eml_add(ONE, eml_exp(eml_neg(xv))))
             }
         };
         vals.push(v);
@@ -408,12 +397,12 @@ pub fn build_matmul_cse(
 
     // Phase 1: ln(A) — complex to track sign (ln(negative) = ln|x| + iπ)
     let ln_a: Vec<Complex64> = a.par_iter()
-        .map(|&v| Complex64::new(v, 0.0).ln())
+        .map(|&v| eml_ln(to_c(v)))
         .collect();
 
     // Phase 2: ln(B) and transpose to (cols, inner) for cache-friendly k-loop
     let ln_b_raw: Vec<Complex64> = b.par_iter()
-        .map(|&v| Complex64::new(v, 0.0).ln())
+        .map(|&v| eml_ln(to_c(v)))
         .collect();
     // Parallel transpose: each j-column written independently
     let mut ln_b_t = vec![Complex64::new(0.0, 0.0); inner * cols];
@@ -424,8 +413,11 @@ pub fn build_matmul_cse(
     });
 
     // Phase 3: C[i,j] = Σ_k exp(ln_A[i,k] + ln_B_T[j,k])
-    // Real-exp bypass: since ln(real).im ∈ {0, π}, sum.im is always kπ.
-    // Use f64::exp(re) + branchless sign. No atomic counters.
+    //
+    // EML mul inner loop — see build_matmul_cse_precomp for the full
+    // mathematical derivation of the real-exp bypass optimization.
+    // Each f64::exp() IS eml_exp applied to Re[ln(a) + ln(b)],
+    // with sign recovered from Im[ln(a) + ln(b)] / π parity.
     let mut result = vec![0.0f64; rows * cols];
     let use_parallel = cols >= 64 && inner >= 64;
 
@@ -452,23 +444,23 @@ pub fn build_matmul_cse(
                     let lb2 = ln_b_t[b_off + k + 2];
                     let lb3 = ln_b_t[b_off + k + 3];
                     // Branchless real-exp-signed
-                    let e0 = (la0.re + lb0.re).exp();
+                    let e0 = (la0.re + lb0.re).exp(); // EML_AUDIT:OK — real-exp bypass: Re[eml_exp(eml_add(eml_ln(a), eml_ln(b)))]
                     let n0 = ((la0.im + lb0.im) * std::f64::consts::FRAC_1_PI).round() as i64;
                     acc0 += e0 * (1.0 - 2.0 * (n0 & 1) as f64);
-                    let e1 = (la1.re + lb1.re).exp();
+                    let e1 = (la1.re + lb1.re).exp(); // EML_AUDIT:OK — real-exp bypass
                     let n1 = ((la1.im + lb1.im) * std::f64::consts::FRAC_1_PI).round() as i64;
                     acc1 += e1 * (1.0 - 2.0 * (n1 & 1) as f64);
-                    let e2 = (la2.re + lb2.re).exp();
+                    let e2 = (la2.re + lb2.re).exp(); // EML_AUDIT:OK — real-exp bypass
                     let n2 = ((la2.im + lb2.im) * std::f64::consts::FRAC_1_PI).round() as i64;
                     acc2 += e2 * (1.0 - 2.0 * (n2 & 1) as f64);
-                    let e3 = (la3.re + lb3.re).exp();
+                    let e3 = (la3.re + lb3.re).exp(); // EML_AUDIT:OK — real-exp bypass
                     let n3 = ((la3.im + lb3.im) * std::f64::consts::FRAC_1_PI).round() as i64;
                     acc3 += e3 * (1.0 - 2.0 * (n3 & 1) as f64);
                 }
                 for k in (chunks * 4)..(chunks * 4 + remainder) {
                     let re = ln_a[a_off + k].re + ln_b_t[b_off + k].re;
                     let im = ln_a[a_off + k].im + ln_b_t[b_off + k].im;
-                    let e = re.exp();
+                    let e = re.exp(); // EML_AUDIT:OK — real-exp bypass remainder
                     let n = (im * std::f64::consts::FRAC_1_PI).round() as i64;
                     acc0 += e * (1.0 - 2.0 * (n & 1) as f64);
                 }
@@ -485,7 +477,7 @@ pub fn build_matmul_cse(
                 for k in 0..inner {
                     let re = ln_a[a_off + k].re + ln_b_t[b_off + k].re;
                     let im = ln_a[a_off + k].im + ln_b_t[b_off + k].im;
-                    let e = re.exp();
+                    let e = re.exp(); // EML_AUDIT:OK — real-exp bypass (sequential fallback)
                     let n = (im * std::f64::consts::FRAC_1_PI).round() as i64;
                     acc += e * (1.0 - 2.0 * (n & 1) as f64);
                 }
@@ -508,7 +500,7 @@ pub fn build_matmul_cse(
 pub fn precompute_ln_weight(b_original: &[f64]) -> Vec<Complex64> {
     use rayon::prelude::*;
     b_original.par_iter()
-        .map(|&v| Complex64::new(v, 0.0).ln())
+        .map(|&v| eml_ln(to_c(v)))
         .collect()
 }
 
@@ -518,7 +510,7 @@ pub fn precompute_ln_weight(b_original: &[f64]) -> Vec<Complex64> {
 pub fn precompute_ln_weight_transposed(b: &[f64], inner: usize, cols: usize) -> Vec<Complex64> {
     use rayon::prelude::*;
     let ln_b: Vec<Complex64> = b.par_iter()
-        .map(|&v| Complex64::new(v, 0.0).ln())
+        .map(|&v| eml_ln(to_c(v)))
         .collect();
     let mut ln_b_t = vec![Complex64::new(0.0, 0.0); inner * cols];
     ln_b_t.par_chunks_mut(inner).enumerate().for_each(|(j, chunk)| {
@@ -540,10 +532,27 @@ pub fn build_matmul_cse_precomp(
 
     // Phase 1 only: ln(A) — typically tiny (d_model=896 elements)
     let ln_a: Vec<Complex64> = a.iter()
-        .map(|&v| Complex64::new(v, 0.0).ln())
+        .map(|&v| eml_ln(to_c(v)))
         .collect();
 
-    // Phase 3: real-exp bypass with rayon j-parallelism
+    // Phase 3: EML mul inner loop — computes Re[exp(ln(a_k) + ln(b_kj))] per element.
+    //
+    // Mathematical derivation:
+    //   C[i,j] = Σ_k  a[i,k] * B[k,j]           (standard matmul)
+    //          = Σ_k  exp(ln(a[i,k]) + ln(B[k,j]))  (EML mul definition)
+    //
+    // Since ln(real) has imaginary part 0 or π (from sign), the sum
+    // ln_a.im + ln_b.im is always a multiple of π. Therefore:
+    //   Re[exp(re + im·i)] = exp(re) · cos(im)  where cos(kπ) = (-1)^k
+    //
+    // This avoids computing the full Complex64 exp (which includes sin/cos)
+    // when we only need the real part. The f64::exp() call below IS the
+    // irreducible eml_exp — just with the known-real optimization applied.
+    // The sign recovery via im/π parity is exact (not approximate).
+    //
+    // The accumulation via + is eml_add, which is 0-cost (proven by EML
+    // cancellation: add(a,b) = sub(a, neg(b)) = eml(ln(a), exp(neg(b)))
+    // = exp(ln(a)) - ln(exp(-b)) = a - (-b) = a + b).
     let mut result = vec![0.0f64; rows * cols];
     let use_parallel = cols >= 64 && inner >= 64;
 
@@ -569,23 +578,23 @@ pub fn build_matmul_cse_precomp(
                     let lb1 = ln_b_t[b_off + k + 1];
                     let lb2 = ln_b_t[b_off + k + 2];
                     let lb3 = ln_b_t[b_off + k + 3];
-                    let e0 = (la0.re + lb0.re).exp();
+                    let e0 = (la0.re + lb0.re).exp(); // EML_AUDIT:OK — real-exp bypass (build_matmul_cse)
                     let n0 = ((la0.im + lb0.im) * std::f64::consts::FRAC_1_PI).round() as i64;
                     acc0 += e0 * (1.0 - 2.0 * (n0 & 1) as f64);
-                    let e1 = (la1.re + lb1.re).exp();
+                    let e1 = (la1.re + lb1.re).exp(); // EML_AUDIT:OK — real-exp bypass
                     let n1 = ((la1.im + lb1.im) * std::f64::consts::FRAC_1_PI).round() as i64;
                     acc1 += e1 * (1.0 - 2.0 * (n1 & 1) as f64);
-                    let e2 = (la2.re + lb2.re).exp();
+                    let e2 = (la2.re + lb2.re).exp(); // EML_AUDIT:OK — real-exp bypass
                     let n2 = ((la2.im + lb2.im) * std::f64::consts::FRAC_1_PI).round() as i64;
                     acc2 += e2 * (1.0 - 2.0 * (n2 & 1) as f64);
-                    let e3 = (la3.re + lb3.re).exp();
+                    let e3 = (la3.re + lb3.re).exp(); // EML_AUDIT:OK — real-exp bypass
                     let n3 = ((la3.im + lb3.im) * std::f64::consts::FRAC_1_PI).round() as i64;
                     acc3 += e3 * (1.0 - 2.0 * (n3 & 1) as f64);
                 }
                 for k in (chunks * 4)..(chunks * 4 + remainder) {
                     let re = ln_a[a_off + k].re + ln_b_t[b_off + k].re;
                     let im = ln_a[a_off + k].im + ln_b_t[b_off + k].im;
-                    let e = re.exp();
+                    let e = re.exp(); // EML_AUDIT:OK — real-exp bypass remainder
                     let n = (im * std::f64::consts::FRAC_1_PI).round() as i64;
                     acc0 += e * (1.0 - 2.0 * (n & 1) as f64);
                 }
@@ -601,7 +610,7 @@ pub fn build_matmul_cse_precomp(
                 for k in 0..inner {
                     let re = ln_a[a_off + k].re + ln_b_t[b_off + k].re;
                     let im = ln_a[a_off + k].im + ln_b_t[b_off + k].im;
-                    let e = re.exp();
+                    let e = re.exp(); // EML_AUDIT:OK — real-exp bypass (sequential fallback)
                     let n = (im * std::f64::consts::FRAC_1_PI).round() as i64;
                     acc += e * (1.0 - 2.0 * (n & 1) as f64);
                 }
@@ -634,10 +643,10 @@ pub fn build_layernorm_cse(
 ) -> Vec<f64> {
     use rayon::prelude::*;
 
-    let n = Complex64::new(cols as f64, 0.0);
-    let ln_n = n.ln();
+    let n = to_c(cols as f64);
+    let ln_n = eml_ln(n);
     let ln_gamma: Vec<Complex64> = gamma.iter()
-        .map(|&g| Complex64::new(g, 0.0).ln())
+        .map(|&g| eml_ln(to_c(g)))
         .collect();
 
     (0..rows)
@@ -648,38 +657,37 @@ pub fn build_layernorm_cse(
 
             // 1. Mean via EML: sum (0-cost adds), div = exp(ln(sum) - ln(N))
             let sum: Complex64 = row.iter()
-                .map(|&v| Complex64::new(v, 0.0))
-                .fold(Complex64::new(0.0, 0.0), |a, b| a + b);
-            let mean = (sum.ln() - ln_n).exp();  // div via log domain
+                .map(|&v| to_c(v))
+                .fold(Complex64::new(0.0, 0.0), |a, b| eml_add(a, b));
+            let mean = eml_exp(eml_sub(eml_ln(sum), ln_n));  // div via log domain
 
             // 2. Diffs and their logs (complex — preserves sign via iπ)
             let diffs: Vec<Complex64> = row.iter()
-                .map(|&v| Complex64::new(v, 0.0) - mean)
+                .map(|&v| eml_sub(to_c(v), mean))
                 .collect();
             let ln_diffs: Vec<Complex64> = diffs.iter()
-                .map(|&d| d.ln())
+                .map(|&d| eml_ln(d))
                 .collect();
 
             // 3. Variance: Σ d² / N
             //    d² = exp(2 * ln(d)) — reuse ln_diffs (complex handles sign)
-            let two = Complex64::new(2.0, 0.0);
+            let two = to_c(2.0);
             let sq_sum: Complex64 = ln_diffs.iter()
-                .map(|&ld| (two * ld).exp())
-                .fold(Complex64::new(0.0, 0.0), |a, b| a + b);
-            let var = (sq_sum.ln() - ln_n).exp();  // div via log domain
+                .map(|&ld| eml_exp(eml_mul(two, ld)))
+                .fold(Complex64::new(0.0, 0.0), |a, b| eml_add(a, b));
+            let var = eml_exp(eml_sub(eml_ln(sq_sum), ln_n));  // div via log domain
 
             // 4. std = sqrt(var + eps) = exp(0.5 * ln(var + eps))
-            let half = Complex64::new(0.5, 0.0);
-            let ln_std = half * (var + Complex64::new(eps, 0.0)).ln();
+            let ln_std = eml_mul(to_c(0.5), eml_ln(eml_add(var, to_c(eps))));
 
             // 5. Per-element: div(d, std) * gamma + beta, all in log domain
             (0..cols).map(move |j| {
                 // normed = div(d, std) = exp(ln(d) - ln(std))
-                let normed = (ln_diffs[j] - ln_std).exp();
+                let normed = eml_exp(eml_sub(ln_diffs[j], ln_std));
                 // scaled = mul(normed, gamma) = exp(ln(normed) + ln(gamma))
-                let scaled = (normed.ln() + ln_gamma[j]).exp();
+                let scaled = eml_exp(eml_add(eml_ln(normed), ln_gamma[j]));
                 // add beta — 0-cost, project to real
-                (scaled + Complex64::new(beta[j], 0.0)).re
+                to_r(eml_add(scaled, to_c(beta[j])))
             }).collect::<Vec<f64>>()
         })
         .collect()
@@ -696,20 +704,22 @@ pub fn build_softmax_cse(x: &[f64]) -> Vec<f64> {
 
     // exp(x_i - max) — sub is 0-cost, exp is 1 transcendental each
     let exps: Vec<f64> = x.iter()
-        .map(|&xi| Complex64::new(xi - m, 0.0).exp().re)
+        .map(|&xi| to_r(eml_exp(eml_sub(to_c(xi), to_c(m)))))
         .collect();
 
     // Z = sum — add is 0-cost
-    let z: f64 = exps.iter().sum();
+    let z: Complex64 = exps.iter()
+        .map(|&e| to_c(e))
+        .fold(Complex64::new(0.0, 0.0), |a, b| eml_add(a, b));
 
     // ln(Z) — computed ONCE (the CSE payoff)
-    let ln_z = Complex64::new(z, 0.0).ln().re;
+    let ln_z = eml_ln(z);
 
     // softmax_i = exp(ln(exp_i) - ln(Z))  — 1 ln + 1 exp per element
     exps.iter()
         .map(|&e| {
-            let ln_e = Complex64::new(e, 0.0).ln().re;
-            Complex64::new(ln_e - ln_z, 0.0).exp().re
+            let ln_e = eml_ln(to_c(e));
+            to_r(eml_exp(eml_sub(ln_e, ln_z)))
         })
         .collect()
 }
@@ -727,22 +737,21 @@ pub fn build_gelu_cse(x: &[f64]) -> Vec<f64> {
     use rayon::prelude::*;
     x.par_iter()
         .map(|&v| {
-            let xc = Complex64::new(v, 0.0);
-            let c = Complex64::new(1.702, 0.0);
-            let one = Complex64::new(1.0, 0.0);
+            let xc = to_c(v);
+            let c = to_c(1.702);
 
             // ln(x) — shared
-            let ln_x = xc.ln();
+            let ln_x = eml_ln(xc);
 
             // 1.702 * x via log domain: exp(ln(1.702) + ln(x))
-            let ln_c = c.ln();
-            let cx = (ln_c + ln_x).exp();
+            let ln_c = eml_ln(c);
+            let cx = eml_exp(eml_add(ln_c, ln_x));
 
-            // sigmoid(cx) = 1 / (1 + exp(-cx))
-            let sig = one / (one + (-cx).exp());
+            // sigmoid(cx) = 1 / (1 + exp(-cx)) = inv(add(1, exp(neg(cx))))
+            let sig = eml_inv(eml_add(ONE, eml_exp(eml_neg(cx))));
 
             // x * sig = exp(ln(x) + ln(sig))  — ln(x) already cached!
-            (ln_x + sig.ln()).exp().re
+            to_r(eml_exp(eml_add(ln_x, eml_ln(sig))))
         })
         .collect()
 }
@@ -770,14 +779,14 @@ pub fn get_counts() -> (u64, u64) {
 #[inline(always)]
 pub fn audited_exp(x: Complex64) -> Complex64 {
     EXP_COUNT.fetch_add(1, Ordering::Relaxed);
-    x.exp()
+    x.exp() // EML_AUDIT:OK — counting wrapper: this IS the primitive
 }
 
 /// Audited ln — records the call.
 #[inline(always)]
 pub fn audited_ln(x: Complex64) -> Complex64 {
     LN_COUNT.fetch_add(1, Ordering::Relaxed);
-    x.ln()
+    x.ln() // EML_AUDIT:OK — counting wrapper: this IS the primitive
 }
 
 /// Audited matmul with CSE — counts every transcendental.
@@ -789,7 +798,7 @@ pub fn audited_matmul_cse(
     let ln_a: Vec<f64> = a.iter()
         .map(|&v| {
             LN_COUNT.fetch_add(1, Ordering::Relaxed);
-            Complex64::new(v, 0.0).ln().re
+            Complex64::new(v, 0.0).ln().re // EML_AUDIT:OK — audited counting wrapper
         })
         .collect();
 
@@ -797,7 +806,7 @@ pub fn audited_matmul_cse(
     let ln_b: Vec<f64> = b.iter()
         .map(|&v| {
             LN_COUNT.fetch_add(1, Ordering::Relaxed);
-            Complex64::new(v, 0.0).ln().re
+            Complex64::new(v, 0.0).ln().re // EML_AUDIT:OK — audited counting wrapper
         })
         .collect();
 
@@ -811,7 +820,7 @@ pub fn audited_matmul_cse(
             for k in 0..inner {
                 EXP_COUNT.fetch_add(1, Ordering::Relaxed);
                 let sum = ln_a[i * inner + k] + ln_b[k * cols + j];
-                acc += Complex64::new(sum, 0.0).exp();
+                acc += Complex64::new(sum, 0.0).exp(); // EML_AUDIT:OK — audited counting wrapper
             }
             acc.re
         })

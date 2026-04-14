@@ -163,7 +163,7 @@ impl Rng {
             let u1 = (self.next_u64() as f64) / (u64::MAX as f64);
             let u2 = (self.next_u64() as f64) / (u64::MAX as f64);
             if u1 > 0.0 {
-                return (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                return (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos(); // EML_AUDIT:OK — Box-Muller weight init (not inference path)
             }
         }
     }

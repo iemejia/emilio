@@ -163,6 +163,7 @@ numerical edge cases.
 ## Commit History
 
 ```
+<pending> .eml compiled format: precomputed ln(W) as Complex64, --compile CLI, automation script
 e663c44 emilio: precomputed ln(weights) + optimized matmul — 0.49 → 4.3 tok/s (8.8×)
 02b0dca autoeml exp 15-17: rayon j-parallelism + zero-copy — 456 μs (37.8× faster)
 34dd3e7 autoeml exp 11: branchless sign — ~3,917 μs (77.7% faster than baseline)
@@ -256,4 +257,124 @@ cargo run --bin autoeml --release -- verify
 # Run emilio inference (Qwen2.5-0.5B)
 cargo run --bin emilio --release -- ../models/qwen2.5-0.5b-instruct-q8_0.gguf \
   --generate "The capital of France is"
+
+# Compile and run from .eml format
+cargo run --bin emilio --release -- ../models/qwen2.5-0.5b-instruct-q8_0.gguf \
+  --compile ../models/qwen2.5-0.5b-instruct.eml
+cargo run --bin emilio --release -- ../models/qwen2.5-0.5b-instruct.eml \
+  --chat "What is 2+2?"
+
+# Or use the automation script
+./compile_model.sh models/qwen2.5-0.5b-instruct-q8_0.gguf
 ```
+
+## Compiled .eml Format
+
+### Motivation
+
+The EML inference pipeline has an *offline* stage and a *runtime* stage:
+
+- **Offline (compile time):** dequantize GGUF weights → compute `ln(W)` for each
+  weight matrix → store as `Complex64` in `(cols, inner)` layout. This is a
+  pure function of the model weights and only needs to run once per model.
+
+- **Runtime (inference):** load precomputed `ln(W)`, compute `exp(ln(A) + ln_W_t)`
+  for each matmul. No dequantization, no `ln()` of weights needed.
+
+The `.eml` compiled format persists the offline stage output, making model
+distribution self-contained and independent of GGUF tooling.
+
+### Format Specification (EML v1)
+
+```
+┌─────────────────────────────────────────────────────┐
+│ Header                                              │
+│   magic: "EML1" (4 bytes)                           │
+│   version: u32                                      │
+│   config: vocab_size, n_layers, n_heads, n_kv_heads,│
+│           d_model, d_ff (u32 × 6)                   │
+│           rope_freq_base, rms_norm_eps (f64 × 2)    │
+│           max_seq_len, d_head (u32 × 2)             │
+├─────────────────────────────────────────────────────┤
+│ Tokenizer                                           │
+│   vocab_size, merges_count, bos_id, eos_id (u32 × 4)│
+│   vocab[]: length-prefixed UTF-8 strings            │
+│   merges[]: (left, right) string pairs, rank-ordered│
+├─────────────────────────────────────────────────────┤
+│ Global Weights                                      │
+│   token_embd: f64[] (vocab × d_model)               │
+│   output_norm: f64[] (d_model)                      │
+│   ln_output: Complex64[] (vocab × d_model)          │
+├─────────────────────────────────────────────────────┤
+│ Per-Layer Weights (× n_layers)                      │
+│   ln_q, ln_k, ln_v, ln_o: Complex64[]              │
+│   ln_gate, ln_up, ln_down: Complex64[]              │
+│   q_bias, k_bias, v_bias: f64[]                     │
+│   attn_norm, ffn_norm: f64[]                        │
+└─────────────────────────────────────────────────────┘
+```
+
+All multi-byte values are little-endian. Arrays are length-prefixed with `u64`
+element count. Complex64 values are stored as `(re: f64, im: f64)` pairs.
+
+**Key design decision:** Raw f64 weight matrices are NOT stored in the .eml
+format. They are only needed to compute `ln(W)`, which is done at compile time.
+During inference, only `ln_*` (Complex64), biases, norms, and embeddings are
+accessed — confirmed by exhaustive grep of all weight field references in
+`emilio.rs`.
+
+### Benchmark: GGUF vs .eml
+
+| Metric | GGUF (Q8_0) | .eml (EML v1) | Notes |
+|--------|-------------|---------------|-------|
+| **File size** | ~530 MB | 8,580 MB | 16× larger (Complex64 = 16 bytes vs Q8 = 1 byte) |
+| **Load time** | ~1.9 s | ~2.6 s | .eml is I/O bound on 8.6 GB read |
+| **Inference** | ~6.8 tok/s | ~7.1 tok/s | Equivalent (same runtime path) |
+| **Dependencies** | GGUF parser + dequant | Pure binary read | .eml is self-contained |
+
+**Honest assessment:** The current .eml format does not improve load time over
+GGUF Q8. The GGUF file is 16× smaller because Q8 quantization stores 1 byte per
+weight vs 16 bytes for Complex64 (2 × f64). The smaller I/O footprint of GGUF +
+runtime dequant+ln computation is faster than reading the 8.6 GB .eml file.
+
+**Where .eml wins:**
+1. **Self-contained:** No GGUF parser, no dequantization code, no quantization
+   format knowledge needed at runtime.
+2. **Pre-verified:** The `ln(W)` values are computed once and can be validated
+   before distribution.
+3. **mmap-ready:** The flat binary layout enables memory-mapped I/O (future work),
+   which would give near-instant "load" times — the OS pages in data on demand.
+4. **Format for f16/f32 models:** For models already stored as f16/f32 in GGUF
+   (no quantization compression), the .eml format would be competitive in size
+   while eliminating the `ln(W)` computation.
+
+### Future Work: Memory-Mapped I/O
+
+The .eml v1 format uses length-prefixed arrays, which requires sequential reading.
+A v2 format with fixed-offset header (all tensor offsets precomputed) would enable:
+
+```rust
+let mmap = unsafe { memmap2::Mmap::map(&file)? };
+let ln_q: &[Complex64] = bytemuck::cast_slice(&mmap[offset..offset + size]);
+```
+
+Expected load time with mmap: **< 1 ms** (virtual memory mapping only, actual
+data read deferred to first access). This is the canonical approach used by GGML,
+safetensors, and other ML tensor formats.
+
+### Paper Notes
+
+The .eml compiled format demonstrates the **offline/online separation** inherent
+in the EML formulation. Because `eml(x, y) = exp(x) − ln(y)` decomposes
+multiplication into `exp(ln(a) + ln(b))`, and model weights are constants during
+inference, the `ln(W)` computation can be moved entirely to compile time. This is
+analogous to ahead-of-time (AOT) compilation in traditional computing: the
+compiler pays a one-time cost to enable faster execution.
+
+The trade-off between file size (quantized vs precomputed) and load time
+(compute vs I/O) is an empirical question that depends on hardware I/O bandwidth
+vs CPU throughput. On Apple Silicon M-series with NVMe (7 GB/s read), the
+crossover point is approximately where `ln_compute_time > file_size_delta / io_bandwidth`.
+
+Reference: Odrzywołek (2026) arXiv:2603.21852, Section 3 on EML graph reduction.
+

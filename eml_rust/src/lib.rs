@@ -10,14 +10,18 @@
 //! The Python reference stays the source of truth; verify.py checks that
 //! Rust and Python agree to within 1e-9.
 
-mod eml_ops;
+pub mod eml_ops;
 pub mod eml_optimizer;
+pub mod eml_format;
+pub mod eml_v2;
 pub mod emilio;
 pub mod gguf;
 pub mod model;
 pub mod tokenizer;
 pub mod autoeml_kernel;
 pub mod autoeml_reference;
+#[cfg(feature = "metal")]
+pub mod metal_eml;
 #[cfg(feature = "python")]
 mod python;
 

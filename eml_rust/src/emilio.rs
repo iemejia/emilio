@@ -227,29 +227,28 @@ fn load_tensor(gguf: &GGUFFile, name: &str) -> std::io::Result<Vec<f64>> {
 
 pub fn eml_rms_norm(x: &[f64], gamma: &[f64], eps: f64) -> Vec<f64> {
     let n = x.len();
-    let nc = Complex64::new(n as f64, 0.0);
+    let nc = to_c(n as f64);
 
     // Cache ln(x_i) — shared between squaring and final division
     let ln_x: Vec<Complex64> = x.iter()
-        .map(|&v| Complex64::new(v, 0.0).ln())
+        .map(|&v| eml_ln(to_c(v)))
         .collect();
 
     // x² = exp(2 * ln(x))
-    let two = Complex64::new(2.0, 0.0);
+    let two = to_c(2.0);
     let sq_sum: Complex64 = ln_x.iter()
-        .map(|&lx| (two * lx).exp())
-        .fold(Complex64::new(0.0, 0.0), |a, b| a + b);  // add is 0-cost
+        .map(|&lx| eml_exp(eml_mul(two, lx)))
+        .fold(Complex64::new(0.0, 0.0), |a, b| eml_add(a, b));
 
-    // mean(x²) = sq_sum / N via log domain
-    let mean_sq = (sq_sum.ln() - nc.ln()).exp();
+    // mean(x²) = sq_sum / N via log domain: exp(ln(sq_sum) - ln(N))
+    let mean_sq = eml_div(sq_sum, nc);
 
     // std = sqrt(mean_sq + eps) = exp(0.5 * ln(mean_sq + eps))
-    let half = Complex64::new(0.5, 0.0);
-    let ln_std = half * (mean_sq + Complex64::new(eps, 0.0)).ln();
+    let ln_std = eml_mul(to_c(0.5), eml_ln(eml_add(mean_sq, to_c(eps))));
 
     // Cache ln(gamma)
     let ln_gamma: Vec<Complex64> = gamma.iter()
-        .map(|&g| Complex64::new(g, 0.0).ln())
+        .map(|&g| eml_ln(to_c(g)))
         .collect();
 
     // result_i = x_i * gamma_i / std
@@ -257,7 +256,7 @@ pub fn eml_rms_norm(x: &[f64], gamma: &[f64], eps: f64) -> Vec<f64> {
     // All ln's already cached!
     (0..n)
         .map(|i| {
-            (ln_x[i] + ln_gamma[i] - ln_std).exp().re
+            to_r(eml_exp(eml_sub(eml_add(ln_x[i], ln_gamma[i]), ln_std)))
         })
         .collect()
 }
@@ -292,10 +291,19 @@ impl RopeCache {
 
         for pos in 0..max_len {
             for i in 0..d_half {
-                let freq = 1.0 / base.powf(2.0 * i as f64 / d_head as f64);
-                let angle = pos as f64 * freq;
-                cos[pos * d_half + i] = angle.cos();
-                sin[pos * d_half + i] = angle.sin();
+                // freq = 1 / base^(2i/d_head)
+                // = exp(neg(mul(2i/d_head, ln(base)))) via EML
+                let exponent = to_c(2.0 * i as f64 / d_head as f64);
+                let ln_base = eml_ln(to_c(base));
+                let freq = to_r(eml_exp(eml_neg(eml_mul(exponent, ln_base))));
+
+                // angle = pos * freq via EML mul
+                let angle = to_r(eml_mul(to_c(pos as f64), to_c(freq)));
+
+                // cos(θ) + i·sin(θ) = exp(iθ) — EML exp on complex argument
+                let rot = eml_exp(Complex64::new(0.0, angle));
+                cos[pos * d_half + i] = rot.re;
+                sin[pos * d_half + i] = rot.im;
             }
         }
 
@@ -341,12 +349,11 @@ impl RopeCache {
 pub fn eml_silu(x: &[f64]) -> Vec<f64> {
     x.par_iter()
         .map(|&v| {
-            let xc = Complex64::new(v, 0.0);
-            let one = Complex64::new(1.0, 0.0);
-            // sigmoid(x) = 1 / (1 + exp(-x))
-            let sig = one / (one + (-xc).exp());
-            // silu(x) = x * sigmoid(x) via log domain
-            (xc.ln() + sig.ln()).exp().re
+            let xc = to_c(v);
+            // sigmoid(x) = 1 / (1 + exp(-x)) = inv(add(1, exp(neg(x))))
+            let sig = eml_inv(eml_add(ONE, eml_exp(eml_neg(xc))));
+            // silu(x) = x * sigmoid(x) = exp(ln(x) + ln(sig))
+            to_r(eml_mul(xc, sig))
         })
         .collect()
 }
@@ -571,13 +578,13 @@ fn eml_gqa_attention_one(
     let mut k_new = build_matmul_cse_precomp(x, &layer.ln_k, 1, d, kv_dim);
     let mut v_new = build_matmul_cse_precomp(x, &layer.ln_v, 1, d, kv_dim);
 
-    // Add bias
+    // Add bias (EML add — 0-cost, proven by cancellation)
     for j in 0..q_dim {
-        q[j] += layer.q_bias[j];
+        q[j] = to_r(eml_add(to_c(q[j]), to_c(layer.q_bias[j])));
     }
     for j in 0..kv_dim {
-        k_new[j] += layer.k_bias[j];
-        v_new[j] += layer.v_bias[j];
+        k_new[j] = to_r(eml_add(to_c(k_new[j]), to_c(layer.k_bias[j])));
+        v_new[j] = to_r(eml_add(to_c(v_new[j]), to_c(layer.v_bias[j])));
     }
 
     // Apply RoPE
@@ -652,14 +659,14 @@ fn eml_gqa_attention(
     let mut k = build_matmul_cse_precomp(x, &layer.ln_k, t, d, kv_dim);
     let mut v = build_matmul_cse_precomp(x, &layer.ln_v, t, d, kv_dim);
 
-    // Add bias (0-cost EML adds)
+    // Add bias (EML add — 0-cost, proven by cancellation)
     for i in 0..t {
         for j in 0..q_dim {
-            q[i * q_dim + j] += layer.q_bias[j];
+            q[i * q_dim + j] = to_r(eml_add(to_c(q[i * q_dim + j]), to_c(layer.q_bias[j])));
         }
         for j in 0..kv_dim {
-            k[i * kv_dim + j] += layer.k_bias[j];
-            v[i * kv_dim + j] += layer.v_bias[j];
+            k[i * kv_dim + j] = to_r(eml_add(to_c(k[i * kv_dim + j]), to_c(layer.k_bias[j])));
+            v[i * kv_dim + j] = to_r(eml_add(to_c(v[i * kv_dim + j]), to_c(layer.v_bias[j])));
         }
     }
 
@@ -809,4 +816,230 @@ pub fn emilio_generate(
     eprintln!();
 
     ids
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Metal GPU-accelerated inference
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "metal")]
+pub mod gpu {
+    use super::*;
+    use crate::metal_eml::{MetalContext, GpuModelWeights, ScratchPool};
+
+    /// GPU-accelerated single-token forward pass.
+    /// All matmul projections run on GPU; bias/norm/RoPE/softmax stay on CPU.
+    pub fn forward_one_gpu(
+        token_id: usize,
+        pos: usize,
+        weights: &ModelWeights,
+        gpu_w: &GpuModelWeights,
+        ctx: &MetalContext,
+        pool: &ScratchPool,
+        rope: &RopeCache,
+        kv_cache: &mut KVCache,
+    ) -> Vec<f64> {
+        let cfg = &weights.config;
+        let d = cfg.d_model;
+
+        // 1. Token embedding (discrete lookup — not EML)
+        let mut x: Vec<f64> = weights.token_embd[token_id * d..(token_id + 1) * d].to_vec();
+
+        // 2. Transformer layers
+        for (layer_idx, layer) in weights.layers.iter().enumerate() {
+            let gpu_layer = &gpu_w.layers[layer_idx];
+            x = transformer_layer_one_gpu(
+                &x, layer, gpu_layer, ctx, pool, cfg, rope, pos,
+                &mut kv_cache.layers[layer_idx],
+                &gpu_w.eps_buf,
+            );
+        }
+
+        // 3. Final RMSNorm (CPU — small: d_model elements)
+        let normed = eml_rms_norm(&x, &weights.output_norm, cfg.rms_norm_eps);
+
+        // 4. LM head: (1, d_model) @ (d_model, vocab) — GPU
+        ctx.single_matmul(pool, &normed, &gpu_w.output, 1, d, cfg.vocab_size)
+    }
+
+    fn transformer_layer_one_gpu(
+        x: &[f64],
+        layer: &LayerWeights,
+        gpu_layer: &crate::metal_eml::GpuLayerWeights,
+        ctx: &MetalContext,
+        pool: &ScratchPool,
+        cfg: &QwenConfig,
+        rope: &RopeCache,
+        pos: usize,
+        kv: &mut LayerKVCache,
+        eps_buf: &metal::Buffer,
+    ) -> Vec<f64> {
+        let d = cfg.d_model;
+        let d_ff = cfg.d_ff;
+        let q_dim = cfg.n_heads * cfg.d_head;
+
+        // Pre-attention RMSNorm (CPU)
+        let normed = eml_rms_norm(x, &layer.attn_norm, cfg.rms_norm_eps);
+
+        // Attention producing pre-O-projection weighted output (GPU QKV, CPU attention)
+        let attn_weighted = gqa_attention_one_gpu(
+            &normed, layer, gpu_layer, ctx, pool, cfg, rope, pos, kv,
+        );
+
+        // Fused O→residual→RMSNorm→FFN→residual (1 GPU commit)
+        ctx.batch_o_to_ffn(
+            pool, &attn_weighted, x,
+            &gpu_layer.ffn_norm, eps_buf, gpu_layer,
+            q_dim, d, d_ff,
+        )
+    }
+
+    fn gqa_attention_one_gpu(
+        x: &[f64],
+        layer: &LayerWeights,
+        gpu_layer: &crate::metal_eml::GpuLayerWeights,
+        ctx: &MetalContext,
+        pool: &ScratchPool,
+        cfg: &QwenConfig,
+        rope: &RopeCache,
+        pos: usize,
+        kv: &mut LayerKVCache,
+    ) -> Vec<f64> {
+        let d = cfg.d_model;
+        let d_head = cfg.d_head;
+        let n_heads = cfg.n_heads;
+        let n_kv_heads = cfg.n_kv_heads;
+        let heads_per_kv = n_heads / n_kv_heads;
+        let q_dim = n_heads * d_head;
+        let kv_dim = n_kv_heads * d_head;
+
+        // QKV projections — batched: ln(x) computed once, 3 GPU dispatches, 1 commit
+        let (mut q, mut k_new, mut v_new) = ctx.batch_qkv(
+            pool, x, &gpu_layer.q, &gpu_layer.k, &gpu_layer.v, d, q_dim, kv_dim,
+        );
+
+        // Add bias (CPU — tiny vectors)
+        for j in 0..q_dim {
+            q[j] = to_r(eml_add(to_c(q[j]), to_c(layer.q_bias[j])));
+        }
+        for j in 0..kv_dim {
+            k_new[j] = to_r(eml_add(to_c(k_new[j]), to_c(layer.k_bias[j])));
+            v_new[j] = to_r(eml_add(to_c(v_new[j]), to_c(layer.v_bias[j])));
+        }
+
+        // RoPE (CPU — precomputed tables)
+        for h in 0..n_heads {
+            rope.apply(&mut q[h * d_head..(h + 1) * d_head], pos);
+        }
+        for h in 0..n_kv_heads {
+            rope.apply(&mut k_new[h * d_head..(h + 1) * d_head], pos);
+        }
+
+        // KV cache
+        kv.append(&k_new, &v_new);
+        let t = kv.len;
+
+        // Attention scores (CPU — quadratic in seq_len but small per token)
+        let mut out = vec![0.0f64; d];
+        let scale = to_r(eml_inv(eml_sqrt(to_c(d_head as f64))));
+
+        for h in 0..n_heads {
+            let kv_h = h / heads_per_kv;
+
+            let mut scores = Vec::with_capacity(t);
+            for j in 0..t {
+                let mut dot = Complex64::new(0.0, 0.0);
+                for dd in 0..d_head {
+                    let qv = q[h * d_head + dd];
+                    let kv_val = kv.k[j * kv_dim + kv_h * d_head + dd];
+                    dot = eml_add(dot, eml_mul(to_c(qv), to_c(kv_val)));
+                }
+                scores.push(to_r(eml_mul(dot, to_c(scale))));
+            }
+
+            let attn_w = build_softmax_cse(&scores);
+
+            for dd in 0..d_head {
+                let mut acc = Complex64::new(0.0, 0.0);
+                for j in 0..t {
+                    let vv = kv.v[j * kv_dim + kv_h * d_head + dd];
+                    acc = eml_add(acc, eml_mul(to_c(attn_w[j]), to_c(vv)));
+                }
+                out[h * d_head + dd] = to_r(acc);
+            }
+        }
+
+        // Output projection moved to batch_o_to_ffn — return pre-O weighted output
+        out
+    }
+
+    fn swiglu_ffn_gpu(
+        x: &[f64],
+        _layer: &LayerWeights,
+        gpu_layer: &crate::metal_eml::GpuLayerWeights,
+        ctx: &MetalContext,
+        pool: &ScratchPool,
+        cfg: &QwenConfig,
+    ) -> Vec<f64> {
+        let d = cfg.d_model;
+        let d_ff = cfg.d_ff;
+
+        // Fused FFN: gate+up matmuls → silu_mul_ln → down matmul, all on GPU.
+        // Eliminates CPU silu + eml_mul_vec round-trip.
+        ctx.batch_ffn_fused(pool, x, &gpu_layer.gate, &gpu_layer.up, &gpu_layer.down, d, d_ff)
+    }
+
+    /// GPU-accelerated generation with KV cache.
+    pub fn generate_gpu(
+        prompt: &[usize],
+        weights: &ModelWeights,
+        gpu_w: &GpuModelWeights,
+        ctx: &MetalContext,
+        pool: &ScratchPool,
+        rope: &RopeCache,
+        max_new: usize,
+    ) -> Vec<usize> {
+        let cfg = &weights.config;
+        let mut ids = prompt.to_vec();
+        let max_len = cfg.max_seq_len.min(prompt.len() + max_new + 16);
+        let mut kv_cache = KVCache::new(cfg, max_len);
+
+        eprintln!("  Prefilling {} prompt tokens (GPU)...", prompt.len());
+        let mut _last_logits = Vec::new();
+        for (i, &tok) in prompt.iter().enumerate() {
+            _last_logits = forward_one_gpu(
+                tok, i, weights, gpu_w, ctx, pool, rope, &mut kv_cache,
+            );
+            if (i + 1) % 10 == 0 || i == prompt.len() - 1 {
+                eprint!("\r  Prefilled {}/{}", i + 1, prompt.len());
+            }
+        }
+        eprintln!();
+
+        for step in 0..max_new {
+            let logits = if step == 0 {
+                _last_logits.clone()
+            } else {
+                let last_tok = *ids.last().unwrap();
+                let pos = ids.len() - 1;
+                forward_one_gpu(
+                    last_tok, pos, weights, gpu_w, ctx, pool, rope, &mut kv_cache,
+                )
+            };
+
+            let next_token = logits.iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i)
+                .unwrap();
+
+            ids.push(next_token);
+            eprint!("\r  Generated {}/{} tokens (GPU)", step + 1, max_new);
+
+            if next_token == cfg.vocab_size - 1 { break; }
+        }
+        eprintln!();
+
+        ids
+    }
 }

@@ -28,6 +28,11 @@ fn byte_to_unicode() -> HashMap<u8, char> {
     map
 }
 
+/// Public wrapper for byte_to_unicode (used by eml_format deserializer).
+pub fn byte_to_unicode_pub() -> HashMap<u8, char> {
+    byte_to_unicode()
+}
+
 fn unicode_to_byte() -> HashMap<char, u8> {
     byte_to_unicode().into_iter().map(|(b, c)| (c, b)).collect()
 }
