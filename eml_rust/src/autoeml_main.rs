@@ -479,6 +479,46 @@ fn cmd_verify(_args: &[String]) {
         println!("  {status} {label:<20} ({m}×{k})×({k}×{n})  err={max_err:.2e}  exp={exp_c} ln={ln_c}");
     }
 
+    // Activation sharing: precompute ln(X) once, reuse for Q, K, V
+    println!();
+    println!("── Activation sharing (Q + K + V reuse ln(X)) ────────────");
+    {
+        let (m, k) = (1, 896);
+        let (a, _) = gen_matmul_data(m, k, 1, 42); // same activation
+        let (_, b_q) = gen_matmul_data(m, k, 896, 100); // Q weights
+        let (_, b_k) = gen_matmul_data(m, k, 128, 101); // K weights
+        let (_, b_v) = gen_matmul_data(m, k, 128, 102); // V weights
+
+        let pc_q = autoeml_kernel::precompute_weights(&b_q);
+        let pc_k = autoeml_kernel::precompute_weights(&b_k);
+        let pc_v = autoeml_kernel::precompute_weights(&b_v);
+
+        // Without sharing: compute ln(X) three times
+        autoeml_kernel::reset_counts();
+        let r_q = autoeml_kernel::kernel_fn(&a, &b_q, m, k, 896, &pc_q);
+        let r_k = autoeml_kernel::kernel_fn(&a, &b_k, m, k, 128, &pc_k);
+        let r_v = autoeml_kernel::kernel_fn(&a, &b_v, m, k, 128, &pc_v);
+        let (exp_no, ln_no) = autoeml_kernel::get_counts();
+
+        // With sharing: compute ln(X) once, pass to all three
+        autoeml_kernel::reset_counts();
+        let ln_x = autoeml_kernel::precompute_ln_activations(&a);
+        let r_q2 = autoeml_kernel::kernel_fn_with_ln_a(&a, &b_q, m, k, 896, &pc_q, Some(&ln_x));
+        let r_k2 = autoeml_kernel::kernel_fn_with_ln_a(&a, &b_k, m, k, 128, &pc_k, Some(&ln_x));
+        let r_v2 = autoeml_kernel::kernel_fn_with_ln_a(&a, &b_v, m, k, 128, &pc_v, Some(&ln_x));
+        let (exp_sh, ln_sh) = autoeml_kernel::get_counts();
+
+        let (ok_q, _) = autoeml_reference::allclose(&r_q, &r_q2, 1e-10, 1e-12);
+        let (ok_k, _) = autoeml_reference::allclose(&r_k, &r_k2, 1e-10, 1e-12);
+        let (ok_v, _) = autoeml_reference::allclose(&r_v, &r_v2, 1e-10, 1e-12);
+
+        let all_ok = ok_q && ok_k && ok_v;
+        let saved = (ln_no as i64 - ln_sh as i64).max(0) as u64;
+        let status = if all_ok { total_pass += 1; "PASS" } else { total_fail += 1; "FAIL" };
+        println!("  {status} QKV sharing  without={} ln, with={} ln, saved={} ln",
+                 ln_no, ln_sh, saved);
+    }
+
     println!();
     println!("Results: {total_pass} passed, {total_fail} failed");
     if total_fail > 0 { std::process::exit(1); }

@@ -88,13 +88,36 @@ pub fn kernel_fn(
     cols: usize,
     precomputed: &KernelPrecomputed,
 ) -> Vec<f64> {
+    kernel_fn_with_ln_a(a, b, rows, inner, cols, precomputed, None)
+}
+
+/// Extended kernel that accepts optional precomputed ln(activations).
+///
+/// When the same activation vector feeds multiple weight matrices (Q, K, V),
+/// pass the same `ln_a_cache` to all three to avoid recomputing ln(X) each time.
+/// For M=1, K=896 this saves 896 ln's per reuse.
+pub fn kernel_fn_with_ln_a(
+    a: &[f64],
+    b: &[f64],
+    rows: usize,
+    inner: usize,
+    cols: usize,
+    precomputed: &KernelPrecomputed,
+    ln_a_cache: Option<&[Complex64]>,
+) -> Vec<f64> {
     // ── Strategy: CSE matmul ──────────────────────────────────────────────
     //
-    // Phase 1: Precompute ln(A[i,k]) — full Complex64 to preserve sign
-    //          via ln(negative) = ln|x| + iπ
-    let ln_a: Vec<Complex64> = a.iter()
-        .map(|&v| c_ln(Complex64::new(v, 0.0)))
-        .collect();
+    // Phase 1: Precompute ln(A[i,k]) — use cache if provided, else compute.
+    //          Full Complex64 to preserve sign via ln(negative) = ln|x| + iπ
+    let owned_ln_a: Vec<Complex64>;
+    let ln_a: &[Complex64] = if let Some(cached) = ln_a_cache {
+        cached
+    } else {
+        owned_ln_a = a.iter()
+            .map(|&v| c_ln(Complex64::new(v, 0.0)))
+            .collect();
+        &owned_ln_a
+    };
 
     // Phase 2: ln(B[k,j]) — use precomputed if available, else compute
     //          Store in TRANSPOSED layout: ln_b_t[j * inner + k] so the
@@ -140,4 +163,12 @@ pub fn precompute_weights(weights: &[f64]) -> KernelPrecomputed {
         .map(|&v| c_ln(Complex64::new(v, 0.0)))
         .collect();
     KernelPrecomputed { data }
+}
+
+/// Precompute ln(activations) for sharing across multiple matmuls.
+/// E.g., compute ln(hidden_state) once, reuse for Q, K, V projections.
+pub fn precompute_ln_activations(activations: &[f64]) -> Vec<Complex64> {
+    activations.iter()
+        .map(|&v| c_ln(Complex64::new(v, 0.0)))
+        .collect()
 }
