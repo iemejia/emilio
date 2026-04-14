@@ -35,6 +35,21 @@ pub fn c_exp(x: Complex64) -> Complex64 {
     x.exp()
 }
 
+/// Counted real exp with sign — optimized for EML matmul inner loop.
+/// When ln(a) + ln(b) has imaginary part that's a multiple of π,
+/// this avoids computing full complex exp (which does exp(re)*(cos(im)+i*sin(im))).
+/// Instead: determines sign from im/π parity, does f64 exp(re).
+/// Still counted as one transcendental (exp).
+#[inline(always)]
+fn c_exp_real_signed(sum_re: f64, sum_im: f64) -> f64 {
+    EXP_CALLS.fetch_add(1, Ordering::Relaxed);
+    let e = sum_re.exp();
+    // im is always a multiple of π (0, π, 2π, etc.)
+    // Odd multiples → negative, even → positive
+    let n = (sum_im * std::f64::consts::FRAC_1_PI).round() as i64;
+    if n & 1 == 0 { e } else { -e }
+}
+
 /// Counted ln — the ONLY way to call ln() in this file.
 #[inline(always)]
 pub fn c_ln(x: Complex64) -> Complex64 {
@@ -152,15 +167,18 @@ pub fn kernel_fn_with_ln_a(
     // Phase 3: C[i,j] = Σ_k exp(ln_A[i,k] + ln_B_T[j,k])
     //          Both ln_a[i*inner+k] and ln_b_t[j*inner+k] are now
     //          sequential in the k-loop → cache-friendly.
+    //          Optimization: since all values are ln(real), imaginary parts
+    //          are 0 or π.  Use c_exp_real_signed to avoid complex trig.
     let mut result = vec![0.0f64; rows * cols];
     for i in 0..rows {
         for j in 0..cols {
-            let mut acc = Complex64::new(0.0, 0.0);
+            let mut acc = 0.0f64;
             for k in 0..inner {
-                let sum = ln_a[i * inner + k] + ln_b_t[j * inner + k];
-                acc += c_exp(sum);
+                let la = ln_a[i * inner + k];
+                let lb = ln_b_t[j * inner + k];
+                acc += c_exp_real_signed(la.re + lb.re, la.im + lb.im);
             }
-            result[i * cols + j] = acc.re;
+            result[i * cols + j] = acc;
         }
     }
 
