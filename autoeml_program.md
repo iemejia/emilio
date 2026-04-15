@@ -36,7 +36,7 @@ run 50+ experiments total.
 ### A1. Profile the model
 
 ```bash
-cd eml_rust && cargo run --bin autoeml --release -- profile
+cd emilio && cargo run --bin autoeml --release -- profile
 ```
 
 This shows the analytical transcendental breakdown for Qwen2.5-0.5B.  Read the
@@ -75,7 +75,7 @@ Read every file for context:
 ### B1. Run baseline
 
 ```bash
-cd eml_rust && cargo run --bin autoeml --release -- bench
+cd emilio && cargo run --bin autoeml --release -- bench
 ```
 
 Record the baseline transcendental count and throughput.
@@ -117,7 +117,7 @@ git add src/autoeml_kernel.rs && git commit -m "autoeml exp N: <hypothesis>"
 #### 4. Run
 
 ```bash
-cd eml_rust && cargo run --bin autoeml --release -- bench 2>&1 | tee run.log
+cd emilio && cargo run --bin autoeml --release -- bench 2>&1 | tee run.log
 ```
 
 If it doesn't compile, fix the error immediately.
@@ -164,13 +164,13 @@ Go back to step 1.
 ### C1. Run full verification
 
 ```bash
-cd eml_rust && cargo run --bin autoeml --release -- verify
+cd emilio && cargo run --bin autoeml --release -- verify
 ```
 
 ### C2. Run with precomputed weights
 
 ```bash
-cd eml_rust && cargo run --bin autoeml --release -- bench --precomputed
+cd emilio && cargo run --bin autoeml --release -- bench --precomputed
 ```
 
 ### C3. Report
@@ -337,8 +337,8 @@ When a human asks you to start, do this:
 
 ```
 1. Read this file (autoeml_program.md)
-2. cd eml_rust && cargo run --bin autoeml --release -- profile
-3. cd eml_rust && cargo run --bin autoeml --release -- bench
+2. cd emilio && cargo run --bin autoeml --release -- profile
+3. cd emilio && cargo run --bin autoeml --release -- bench
 4. Record baseline in results.tsv
 5. Start the optimization loop
 ```

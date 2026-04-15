@@ -18,7 +18,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-RUST_DIR="$SCRIPT_DIR/eml_rust"
+RUST_DIR="$SCRIPT_DIR/emilio"
 BINARY="$RUST_DIR/target/release/emilio"
 
 # ── Args ──────────────────────────────────────────────────────────

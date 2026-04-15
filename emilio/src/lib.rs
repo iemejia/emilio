@@ -14,7 +14,7 @@ pub mod eml_ops;
 pub mod eml_optimizer;
 pub mod eml_format;
 pub mod eml_v2;
-pub mod emilio;
+pub mod engine;
 pub mod gguf;
 pub mod model;
 pub mod tokenizer;

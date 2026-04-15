@@ -14,8 +14,8 @@
 //!   cargo run --bin autoeml --release -- bench
 //!   cargo run --bin autoeml --release -- bench --size 896
 
-use eml_rust_core::autoeml_kernel;
-use eml_rust_core::autoeml_reference;
+use emilio::autoeml_kernel;
+use emilio::autoeml_reference;
 use std::time::Instant;
 
 // ─── CLI ────────────────────────────────────────────────────────────────────

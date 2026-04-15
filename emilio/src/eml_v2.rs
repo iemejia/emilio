@@ -20,7 +20,7 @@
 //!
 //! Reference: Odrzywołek (2026) arXiv:2603.21852
 
-use crate::emilio::*;
+use crate::engine::*;
 use crate::eml_ops::*;
 use crate::eml_optimizer::build_softmax_cse;
 use num_complex::Complex64;

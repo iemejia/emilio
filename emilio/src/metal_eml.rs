@@ -609,7 +609,7 @@ pub struct GpuModelWeights {
 impl GpuModelWeights {
     pub fn from_model_weights(
         ctx: &MetalContext,
-        weights: &crate::emilio::ModelWeights,
+        weights: &crate::engine::ModelWeights,
     ) -> Self {
         let cfg = &weights.config;
         let d = cfg.d_model;

@@ -881,7 +881,7 @@ $\geq$1.75, Python~3.10+, NumPy, $\sim$10\,GB disk for model files.
 \subsection{Build the Rust Engine}
 
 \begin{lstlisting}[language=bash,caption={Building emilio.}]
-cd em2/eml_rust
+cd em2/emilio
 cargo build --bin emilio --release            # CPU-only
 cargo build --bin emilio --release --features metal  # GPU
 cargo build --bin autoeml --release
@@ -903,7 +903,7 @@ This is the simplest path: load the GGUF, compute $\ln(W)$ on the fly,
 and run inference.
 
 \begin{lstlisting}[language=bash,caption={GGUF inference (computes ln(W) at load time).}]
-cd eml_rust
+cd emilio
 # CPU-only:
 cargo run --bin emilio --release -- \
   ../models/qwen2.5-0.5b-instruct-q8_0.gguf \
@@ -926,7 +926,7 @@ The v1 format precomputes and persists $\ln(W)$ as Complex64:
 ./compile_model.sh models/qwen2.5-0.5b-instruct-q8_0.gguf
 
 # Or directly:
-cd eml_rust
+cd emilio
 cargo run --bin emilio --release -- \
   ../models/qwen2.5-0.5b-instruct-q8_0.gguf \
   --compile ../models/qwen2.5-0.5b-instruct.eml
@@ -939,7 +939,7 @@ cargo run --bin emilio --release -- \
 Version~2 adds sign+magnitude, fusion, pruning, and the execution graph:
 
 \begin{lstlisting}[language=bash,caption={Compiling to EML v2.}]
-cd eml_rust
+cd emilio
 cargo run --bin emilio --release -- \
   ../models/qwen2.5-0.5b-instruct-q8_0.gguf \
   --compile-v2 ../models/qwen2.5-0.5b-instruct-v2.eml
@@ -971,7 +971,7 @@ cargo run --bin emilio --release -- \
 \subsection{Run Kernel Benchmarks}
 
 \begin{lstlisting}[language=bash,caption={autoeml kernel benchmarks.}]
-cd eml_rust
+cd emilio
 
 # Baseline (naive Complex64 matmul):
 cargo run --bin autoeml --release -- bench --iters 10
@@ -1010,7 +1010,7 @@ python3 bench.py
 \subsection{Compare All Three Paths}
 
 \begin{lstlisting}[language=bash,caption={Head-to-head comparison.}]
-cd eml_rust
+cd emilio
 
 echo "=== GGUF ===" && \
 cargo run --bin emilio --release -- \
@@ -1117,7 +1117,7 @@ companion test verifies that every such marker includes its rationale.
 This test runs as part of the standard \texttt{cargo test} suite:
 
 \begin{lstlisting}[language=bash,caption={Running the purity audit.}]
-cd eml_rust
+cd emilio
 cargo test --test purity_audit
 # test no_raw_transcendentals_outside_allowed_zones ... ok
 # test audit_ok_markers_have_justification ... ok

@@ -1,8 +1,8 @@
-//! PyO3 bindings: expose eml_rust_core to Python as a native module.
+//! PyO3 bindings: expose emilio to Python as a native module.
 //!
-//! The module name is `eml_rust_core` — import as:
-//!   import eml_rust_core
-//!   eml_rust_core.eml_matmul(a, b)
+//! The module name is `emilio` — import as:
+//!   import emilio
+//!   emilio.eml_matmul(a, b)
 
 use numpy::ndarray::ArrayD;
 use numpy::{IntoPyArray, PyArrayDyn, PyReadonlyArrayDyn, PyUntypedArrayMethods};
@@ -176,7 +176,7 @@ fn eml_mul_vec<'py>(
 // ─── Module definition ──────────────────────────────────────────────────────
 
 #[pymodule]
-fn eml_rust_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn emilio(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Scalars
     m.add_function(wrap_pyfunction!(eml, m)?)?;
     m.add_function(wrap_pyfunction!(eml_exp, m)?)?;

@@ -18,7 +18,7 @@
 //! All multi-byte values are little-endian. All arrays are length-prefixed
 //! with a u64 element count.
 
-use crate::emilio::{ModelWeights, LayerWeights, QwenConfig};
+use crate::engine::{ModelWeights, LayerWeights, QwenConfig};
 use crate::eml_v2::*;
 use crate::tokenizer::Tokenizer;
 use num_complex::Complex64;

@@ -21,8 +21,8 @@ a single algebraic identity suffices for every operation in a production transfo
 
 | Path | Description |
 |---|---|
-| `eml_rust/` | **emilio** — Rust inference engine (CPU + Metal GPU) |
-| `eml_rust/src/eml_matmul.metal` | Metal shaders (4 pure-EML kernels) |
+| `emilio/` | **emilio** — Rust inference engine (CPU + Metal GPU) |
+| `emilio/src/eml_matmul.metal` | Metal shaders (4 pure-EML kernels) |
 | `eml_core.py` | Python proof-of-concept with instrumented EML call counts |
 | `eml_model.py` | Python model loader (GGUF → EML forward pass) |
 | `verify.py` | Correctness verification (Python vs reference) |
@@ -48,7 +48,7 @@ a single algebraic identity suffices for every operation in a production transfo
 ### Build
 
 ```bash
-cd eml_rust
+cd emilio
 
 # CPU-only
 cargo build --bin emilio --release
@@ -69,7 +69,7 @@ cd ..
 ### Run inference
 
 ```bash
-cd eml_rust
+cd emilio
 
 # CPU (~5.5 tok/s)
 cargo run --bin emilio --release -- \
@@ -92,7 +92,7 @@ dequantization and log computation at load time.
 ./compile_model.sh models/qwen2.5-0.5b-instruct-q8_0.gguf
 
 # v2: sign+magnitude, fused projections, sparse pruning (~4.9 GB)
-cd eml_rust
+cd emilio
 cargo run --bin emilio --release -- \
   ../models/qwen2.5-0.5b-instruct-q8_0.gguf \
   --compile-v2 ../models/qwen2.5-0.5b-instruct-v2.eml
@@ -141,7 +141,7 @@ All 4 active Metal kernels are pure EML:
 ## Benchmarks
 
 ```bash
-cd eml_rust
+cd emilio
 
 # Kernel microbenchmarks
 cargo run --bin autoeml --release -- bench --transposed --iters 10

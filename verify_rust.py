@@ -1,5 +1,5 @@
 """
-Verify that eml_rust_core (Rust+Rayon) matches eml_core (Python) exactly.
+Verify that emilio (Rust+Rayon) matches eml_core (Python) exactly.
 Also benchmarks both backends.
 """
 
@@ -10,7 +10,7 @@ import numpy as np
 import eml_core as py
 
 # Rust fused+parallel
-import eml_rust_core as rs
+import emilio as rs
 
 def check(name, py_val, rs_val, tol=1e-9):
     py_v = np.real(py_val)

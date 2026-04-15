@@ -241,7 +241,7 @@ At ~4.3 tok/s, each token takes ~230 ms across 24 layers:
 ## Running AutoEML
 
 ```bash
-cd eml_rust
+cd emilio
 
 # Profile transcendental budget
 cargo run --bin autoeml --release -- profile

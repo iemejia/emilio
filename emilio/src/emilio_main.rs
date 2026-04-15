@@ -6,14 +6,14 @@
 //!   emilio <model.gguf> --compile-v2 [output.eml]    (v2: sign+mag, fused, pruned)
 //!   emilio <model.gguf> --generate --gpu "text"       (Metal GPU acceleration)
 
-use eml_rust_core::gguf::GGUFFile;
-use eml_rust_core::emilio::*;
-use eml_rust_core::eml_format;
-use eml_rust_core::eml_v2::{self as v2, v2_generate};
-use eml_rust_core::tokenizer::Tokenizer;
+use emilio::gguf::GGUFFile;
+use emilio::engine::*;
+use emilio::eml_format;
+use emilio::eml_v2::{self as v2, v2_generate};
+use emilio::tokenizer::Tokenizer;
 use std::time::Instant;
 #[cfg(feature = "metal")]
-use eml_rust_core::metal_eml::{MetalContext, GpuModelWeights, ScratchPool};
+use emilio::metal_eml::{MetalContext, GpuModelWeights, ScratchPool};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -704,7 +704,7 @@ fn generate_metal(gguf: &GGUFFile, prompt: &[usize], tok: &Tokenizer) {
 
     let max_new = 16;
     let t1 = Instant::now();
-    let output = eml_rust_core::emilio::gpu::generate_gpu(
+    let output = emilio::engine::gpu::generate_gpu(
         prompt, &weights, &gpu_w, &ctx, &pool, &rope, max_new,
     );
     let gen_s = t1.elapsed().as_secs_f64();

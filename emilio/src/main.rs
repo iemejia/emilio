@@ -4,8 +4,8 @@
 //! Single binary — no Python needed.
 
 use egg::RecExpr;
-use eml_rust_core::*;
-use eml_rust_core::model::*;
+use emilio::*;
+use emilio::model::*;
 use std::process;
 
 fn main() {

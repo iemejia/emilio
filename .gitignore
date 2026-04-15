@@ -9,7 +9,7 @@ __pycache__/
 
 # Rust
 target/
-eml_rust/target/
+emilio/target/
 Cargo.lock
 
 # macOS
