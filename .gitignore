@@ -23,3 +23,13 @@ Cargo.lock
 # IDE
 .idea/
 .vscode/
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.synctex.gz
