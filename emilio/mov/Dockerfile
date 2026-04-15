@@ -1,4 +1,4 @@
-# Dockerfile -- Reproducible build environment for emilio MOV-only binary
+# Dockerfile -- Reproducible build environment for emilio 100% MOV binary
 #
 # Uses a 32-bit (i386) Debian base so the movfuscator, LCC, and the
 # resulting binary are all native 32-bit -- no cross-compilation needed.
@@ -6,7 +6,7 @@
 # Build:
 #   docker build -t emilio-mov -f mov/Dockerfile mov/
 #
-# Extract the MOV-only binary:
+# Extract the 100% MOV binary:
 #   docker run --rm -v $(pwd)/mov/build:/out emilio-mov
 #
 # Run with verification:

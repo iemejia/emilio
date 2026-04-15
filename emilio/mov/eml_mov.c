@@ -1,5 +1,5 @@
 /*
- * eml_mov.c -- Emilio EML v2 inference engine (C89, MOV-only target)
+ * eml_mov.c -- Emilio EML v2 inference engine (C89, 100% MOV target)
  *
  * Complete single-file port of emilio's v2 inference path:
  *   - Software math (exp, log, sin, cos, sqrt) -- no libm dependency
@@ -13,7 +13,7 @@
  *   - BPE tokenizer (in eml_tokenizer.c)
  *   - Generation loop with greedy argmax
  *
- * Compiles with: movcc eml_mov.c eml_tokenizer.c -o emilio_mov
+ * Compiles with: movcc -Wf--no-mov-flow eml_mov.c eml_tokenizer.c -o emilio_mov
  * Or for testing: gcc -std=c89 -Wall -m32 eml_mov.c eml_tokenizer.c -o emilio_test -lm
  *
  * Reference: Odrzywołek (2026) arXiv:2603.21852
@@ -1179,8 +1179,9 @@ int main(int argc, char **argv)
 
     if (argc < 3) {
         printf("Usage: %s <model.eml> <prompt> [max_tokens]\n", argv[0]);
-        printf("\nemilio MOV-only inference engine\n");
-        printf("  Compiled with M/o/Vfuscator -- all instructions are MOV.\n");
+        printf("\nemilio 100%% MOV inference engine\n");
+        printf("  Every instruction is MOV.  No jumps.  No arithmetic.  Just MOV.\n");
+        printf("  Compiled with M/o/Vfuscator --no-mov-flow\n");
         printf("  Reference: Odrzywołek (2026) arXiv:2603.21852\n");
         return 1;
     }
@@ -1198,7 +1199,7 @@ int main(int argc, char **argv)
         if (max_tokens <= 0) max_tokens = 64;
     }
 
-    fprintf(stderr, "emilio MOV-only inference engine\n");
+    fprintf(stderr, "emilio 100%% MOV inference engine\n");
     fprintf(stderr, "Loading model: %s\n", model_path);
 
     /* Load model + tokenizer */

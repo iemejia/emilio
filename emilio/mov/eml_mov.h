@@ -1,8 +1,8 @@
 /*
- * eml_mov.h -- Emilio EML inference engine (C89, MOV-only target)
+ * eml_mov.h -- Emilio EML inference engine (C89, 100% MOV target)
  *
  * Minimal C89 port of emilio's v2 inference path for compilation
- * with the M/o/Vfuscator (mov-only x86 compiler).
+ * with the M/o/Vfuscator (mov-only x86 compiler, --no-mov-flow).
  *
  * All system headers are avoided; libc prototypes declared manually
  * to bypass LCC's inability to parse modern C99 system headers.

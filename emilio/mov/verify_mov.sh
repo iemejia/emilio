@@ -3,18 +3,18 @@
 #
 # Checks:
 #   1. Binary is ELF32 i386 (movfuscator only targets 32-bit x86)
-#   2. >90% of disassembled .text bytes decode as MOV instructions
-#   3. No standard GCC function prologues (push ebp; mov ebp,esp)
+#   2. User code is 100% MOV (excluding PLT stubs and CRT bootstrap)
+#   3. Full binary is >90% MOV (including PLT/CRT overhead)
+#   4. No standard GCC function prologues (push ebp; mov ebp,esp)
 #
-# The movfuscator embeds large data lookup tables directly in .text
-# for computed branching.  objdump will linearly disassemble these as
-# random x86 instructions, so ~5% "non-MOV" is normal and expected.
-# A GCC-compiled binary typically has <30% MOV.
+# Two metrics are reported:
+#   - "User code MOV%"  -- only emilio functions (must be 100%)
+#   - "Full binary MOV%" -- includes PLT stubs + CRT setup (~98%)
 #
 # Usage: ./verify_mov.sh <binary>
 #
 # Exit code:
-#   0 = binary is a valid movfuscator binary
+#   0 = binary is a valid movfuscator binary (100% MOV user code)
 #   1 = binary was NOT compiled with the movfuscator
 
 set -e
@@ -54,11 +54,10 @@ fi
 echo "Architecture: $ELFCLASS ($MACHINE)"
 echo ""
 
-# ---- Check 2: MOV instruction ratio ----
-# Movfuscator binaries are >90% MOV in .text (typically 93-97%).
-# GCC binaries are typically <30% MOV.
-# The gap between data tables (~5% non-MOV) and GCC (~70% non-MOV)
-# makes this a reliable classifier.
+# ---- Check 2: MOV instruction ratio (full binary) ----
+# Movfuscator binaries compiled with --no-mov-flow have 100% MOV user code.
+# The only non-MOV instructions are in PLT stubs (dynamic libc dispatch)
+# and a few CRT bootstrap instructions (signal handler setup).
 
 DISASM=$(objdump -d -j .text "$BINARY" 2>/dev/null || objdump -d "$BINARY")
 
@@ -76,40 +75,68 @@ MOV_COUNT=$(echo "$DISASM" | grep -E '^\s+[0-9a-f]+:' | \
 echo "MOV instructions: $MOV_COUNT"
 
 NON_MOV_COUNT=$((TOTAL - MOV_COUNT))
-echo "Non-MOV disassembled bytes: $NON_MOV_COUNT"
+echo "Non-MOV instructions: $NON_MOV_COUNT"
 
-# Calculate MOV percentage (integer arithmetic, multiply first to avoid truncation)
 MOV_PCT=$((MOV_COUNT * 100 / TOTAL))
-echo "MOV ratio: ${MOV_PCT}%"
+echo "Full binary MOV ratio: ${MOV_PCT}%"
 echo ""
 
-# Threshold: movfuscator binaries are >90% MOV; GCC binaries are <30% MOV
-MOV_THRESHOLD=90
+# ---- Check 2b: User code MOV ratio (excluding PLT + CRT) ----
+# Extract only user-code sections: skip PLT stubs (<*@plt>) and
+# CRT symbols (_start, __libc_*, deregister_tm_clones, etc.)
 
-if [ "$MOV_PCT" -lt "$MOV_THRESHOLD" ]; then
-    echo "FAIL: MOV ratio ${MOV_PCT}% is below ${MOV_THRESHOLD}% threshold."
-    echo "  Movfuscator binaries are typically >93% MOV."
-    echo "  GCC binaries are typically <30% MOV."
-    echo "  This binary was likely NOT compiled with movcc."
-    exit 1
+# Filter out PLT section and known CRT/linker functions
+USER_DISASM=$(echo "$DISASM" | awk '
+    /^[0-9a-f]+ <.*@plt>:/       { in_skip=1; next }
+    /^[0-9a-f]+ <_start>:/       { in_skip=1; next }
+    /^[0-9a-f]+ <__libc/         { in_skip=1; next }
+    /^[0-9a-f]+ <_dl_/           { in_skip=1; next }
+    /^[0-9a-f]+ <__do_global/    { in_skip=1; next }
+    /^[0-9a-f]+ <deregister_tm/  { in_skip=1; next }
+    /^[0-9a-f]+ <register_tm/    { in_skip=1; next }
+    /^[0-9a-f]+ <frame_dummy/    { in_skip=1; next }
+    /^[0-9a-f]+ <__x86.get_pc/   { in_skip=1; next }
+    /^[0-9a-f]+ <_fini>:/        { in_skip=1; next }
+    /^[0-9a-f]+ <_init>:/        { in_skip=1; next }
+    /^[0-9a-f]+ <\.plt/          { in_skip=1; next }
+    /^[0-9a-f]+ </               { in_skip=0 }
+    /^$/                          { next }
+    { if (!in_skip) print }
+')
+
+USER_TOTAL=$(echo "$USER_DISASM" | grep -cE '^\s+[0-9a-f]+:' || true)
+USER_MOV=$(echo "$USER_DISASM" | grep -E '^\s+[0-9a-f]+:' | \
+    grep -ciE '\bmov[a-z]*\b' || true)
+USER_NON_MOV=$((USER_TOTAL - USER_MOV))
+
+if [ "$USER_TOTAL" -gt 0 ]; then
+    USER_MOV_PCT=$((USER_MOV * 100 / USER_TOTAL))
+else
+    USER_MOV_PCT=0
 fi
 
-# ---- Check 3: No GCC function prologues ----
+echo "=== User Code Analysis ==="
+echo "  User code instructions: $USER_TOTAL"
+echo "  User code MOV:          $USER_MOV"
+echo "  User code non-MOV:      $USER_NON_MOV"
+echo "  User code MOV ratio:    ${USER_MOV_PCT}%"
+echo ""
+
+# ---- Check 3: No GCC function prologues in user code ----
 # GCC-compiled functions start with "push %ebp; mov %ebp,%esp" (or similar).
 # Movfuscator-compiled code never uses push/pop/call/ret in user functions.
 
-GCC_PROLOGUES=$(echo "$DISASM" | grep -cE '^\s+[0-9a-f]+:.*\bpush\s+%ebp\b' || true)
+GCC_PROLOGUES=$(echo "$USER_DISASM" | grep -cE '^\s+[0-9a-f]+:.*\bpush\s+%ebp\b' || true)
 
-if [ "$GCC_PROLOGUES" -gt 5 ]; then
-    echo "WARNING: Found $GCC_PROLOGUES 'push %ebp' instructions."
+if [ "$GCC_PROLOGUES" -gt 0 ]; then
+    echo "WARNING: Found $GCC_PROLOGUES 'push %ebp' in user code."
     echo "  This may indicate GCC-compiled code mixed in."
-    # Don't fail -- CRT startup code has a few push instructions
 fi
 
 # ---- Results ----
 
-echo "=== Instruction Breakdown (top 20) ==="
-echo "$DISASM" | grep -E '^\s+[0-9a-f]+:' | \
+echo "=== Instruction Breakdown (top 20, user code) ==="
+echo "$USER_DISASM" | grep -E '^\s+[0-9a-f]+:' | \
     sed 's/.*:\s\+[0-9a-f ]\+\s\+//' | \
     awk '{print $1}' | sort | uniq -c | sort -rn | head -20
 echo ""
@@ -123,13 +150,45 @@ PLT_NON_MOV=$(echo "$DISASM" | \
     wc -l || true)
 
 echo "=== Analysis ==="
-echo "  MOV ratio:                            ${MOV_PCT}% (threshold: ${MOV_THRESHOLD}%)"
-echo "  PLT stubs (expected, for libc calls):  ~$PLT_NON_MOV non-MOV"
-echo "  Data tables in .text (expected):       ~$((NON_MOV_COUNT - PLT_NON_MOV)) disassembly artifacts"
+echo "  User code MOV ratio:                  ${USER_MOV_PCT}% (target: 100%)"
+echo "  Full binary MOV ratio:                ${MOV_PCT}%"
+echo "  PLT stubs (libc dispatch, expected):  ~$PLT_NON_MOV non-MOV"
+echo "  CRT bootstrap (expected):             ~$((NON_MOV_COUNT - PLT_NON_MOV - USER_NON_MOV)) non-MOV"
 echo ""
-echo "  The M/o/Vfuscator embeds lookup tables in .text for computed"
-echo "  branching.  objdump disassembles these data bytes as random"
-echo "  x86 instructions.  This is expected -- they are never executed."
-echo ""
-echo "PASS: Binary is a valid M/o/Vfuscator binary (${MOV_PCT}% MOV)"
-exit 0
+
+# ---- Pass/Fail ----
+
+# User code must be 100% MOV (the whole point of --no-mov-flow)
+USER_THRESHOLD=100
+# Full binary allows a few PLT/CRT stubs
+FULL_THRESHOLD=90
+
+PASSED=1
+
+if [ "$USER_MOV_PCT" -lt "$USER_THRESHOLD" ] && [ "$USER_TOTAL" -gt 0 ]; then
+    echo "FAIL: User code MOV ratio ${USER_MOV_PCT}% < ${USER_THRESHOLD}%"
+    echo ""
+    echo "  Non-MOV instructions in user code:"
+    echo "$USER_DISASM" | grep -E '^\s+[0-9a-f]+:' | \
+        grep -viE '\bmov[a-z]*\b' | head -20
+    echo ""
+    PASSED=0
+fi
+
+if [ "$MOV_PCT" -lt "$FULL_THRESHOLD" ]; then
+    echo "FAIL: Full binary MOV ratio ${MOV_PCT}% < ${FULL_THRESHOLD}%"
+    PASSED=0
+fi
+
+if [ "$PASSED" = "1" ]; then
+    if [ "$USER_MOV_PCT" -ge 100 ] && [ "$USER_TOTAL" -gt 0 ]; then
+        echo "PASS: 100% MOV -- every user instruction is MOV (${USER_TOTAL} instructions)"
+        echo "  Full binary: ${MOV_PCT}% (${NON_MOV_COUNT} non-MOV in PLT/CRT only)"
+    else
+        echo "PASS: Binary is a valid M/o/Vfuscator binary"
+        echo "  User code: ${USER_MOV_PCT}% MOV | Full binary: ${MOV_PCT}% MOV"
+    fi
+    exit 0
+else
+    exit 1
+fi

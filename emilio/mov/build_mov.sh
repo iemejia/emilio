@@ -4,7 +4,11 @@
 # This script:
 #   1. Clones and builds the movfuscator (with LCC frontend + softfloat)
 #   2. Compiles eml_mov.c + eml_tokenizer.c with movcc
-#   3. Produces emilio_mov (32-bit ELF, MOV-only instructions)
+#   3. Produces emilio_mov (32-bit ELF, 100% MOV instructions)
+#
+# By default, builds in pure-MOV mode (--no-mov-flow): all control flow
+# is via SIGSEGV fault handler, producing 100% MOV user code with zero
+# computed jumps.  Use --fast for the jmp-table mode (~94% MOV).
 #
 # The movfuscator build is done inline (not via upstream build.sh) so
 # that modern-GCC fixes can be applied at the right point in the
@@ -16,7 +20,8 @@
 #   - Or use the provided Dockerfile
 #
 # Usage:
-#   ./build_mov.sh              # full build
+#   ./build_mov.sh              # full build (100% MOV, fault-based flow)
+#   ./build_mov.sh --fast        # build with jmp-table flow (~94% MOV)
 #   ./build_mov.sh --gcc-test   # test with gcc first (sanity check)
 #   ./build_mov.sh --verify     # build + verify MOV-only
 
@@ -38,14 +43,18 @@ die() { echo "[build_mov] ERROR: $*" >&2; exit 1; }
 
 GCC_TEST=0
 VERIFY=0
+FAST_MODE=0
 for arg in "$@"; do
     case "$arg" in
         --gcc-test) GCC_TEST=1 ;;
         --verify)   VERIFY=1 ;;
+        --fast)     FAST_MODE=1 ;;
         --help|-h)
-            echo "Usage: $0 [--gcc-test] [--verify]"
+            echo "Usage: $0 [--gcc-test] [--verify] [--fast]"
             echo "  --gcc-test  Compile with gcc -std=c89 -m32 first (sanity check)"
             echo "  --verify    After building, verify the binary is MOV-only"
+            echo "  --fast      Use jmp-table flow (~94%% MOV, faster execution)"
+            echo "              Default: fault-based flow (100%% MOV user code)"
             exit 0
             ;;
     esac
@@ -197,7 +206,17 @@ if [ ! -f "$MOVCC" ]; then
     die "movcc not found at $MOVCC"
 fi
 
-log "Compiling emilio with movfuscator..."
+# Select build mode: pure-MOV (fault-based) or fast (jmp-table)
+if [ "$FAST_MODE" = "1" ]; then
+    log "Compiling emilio with movfuscator (jmp-table mode, ~94%% MOV)..."
+    MOVFLOW_FLAG=""
+    SOFTFLOAT_OBJ="$MOVFUSC_DIR/movfuscator/lib/softfloat64.o"
+else
+    log "Compiling emilio with movfuscator (pure-MOV mode, fault-based flow)..."
+    log "  100%% MOV: all control flow via SIGSEGV handler -- zero jumps."
+    MOVFLOW_FLAG="-Wf--no-mov-flow"
+    SOFTFLOAT_OBJ="$MOVFUSC_DIR/movfuscator/lib/softfloat64_cf.o"
+fi
 log "  This will take a while -- every instruction becomes MOV."
 
 # movcc compiles C89 through LCC -> MOV-only x86 assembly -> as -> ld
@@ -210,11 +229,17 @@ log "  This will take a while -- every instruction becomes MOV."
 # The softfloat64.o library is needed because the movfuscator converts
 # all floating-point operations (double) to software float function calls
 # (float64_add, float64_mul, int32_to_float64, etc.).
+#
+# In pure-MOV mode (--no-mov-flow), the movfuscator uses SIGSEGV-based
+# control flow instead of computed jmp tables.  This eliminates the
+# ~5% of .text that was data-as-code (lookup tables for jmp targets)
+# and makes every user instruction a genuine MOV.
 
 "$MOVCC" \
+    $MOVFLOW_FLAG \
     "$SCRIPT_DIR/eml_mov.c" \
     "$SCRIPT_DIR/eml_tokenizer.c" \
-    "$MOVFUSC_DIR/movfuscator/lib/softfloat64.o" \
+    "$SOFTFLOAT_OBJ" \
     -o "$BUILD_DIR/emilio_mov"
 
 log "Build complete: $BUILD_DIR/emilio_mov"

@@ -116,10 +116,10 @@ if [ -f "$BUILD_DIR/emilio_gcc" ]; then
         echo "$USAGE"
     fi
 
-    if echo "$USAGE" | grep -q "MOV-only"; then
-        pass "Main binary: MOV-only branding present"
+    if echo "$USAGE" | grep -qE "100.*MOV|MOV-only"; then
+        pass "Main binary: MOV branding present"
     else
-        fail "Main binary: missing MOV-only branding"
+        fail "Main binary: missing MOV branding"
     fi
 else
     skip "Main binary not found (compilation failed)"
@@ -138,8 +138,9 @@ if [ "$FULL" = "1" ]; then
     fi
 
     if [ -f "$MOVCC" ]; then
-        log "Compiling with movfuscator (this takes a LONG time)..."
+        log "Compiling with movfuscator --no-mov-flow (this takes a LONG time)..."
         "$MOVCC" \
+            -Wf--no-mov-flow \
             "$SCRIPT_DIR/eml_mov.c" \
             "$SCRIPT_DIR/eml_tokenizer.c" \
             -o "$BUILD_DIR/emilio_mov"
