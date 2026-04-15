@@ -36,21 +36,6 @@ pub fn c_exp(x: Complex64) -> Complex64 {
     x.exp()
 }
 
-/// Counted real exp with sign — optimized for EML matmul inner loop.
-/// When ln(a) + ln(b) has imaginary part that's a multiple of π,
-/// this avoids computing full complex exp (which does exp(re)*(cos(im)+i*sin(im))).
-/// Instead: determines sign from im/π parity, does f64 exp(re).
-/// Still counted as one transcendental (exp).
-#[inline(always)]
-fn c_exp_real_signed(sum_re: f64, sum_im: f64) -> f64 {
-    EXP_CALLS.fetch_add(1, Ordering::Relaxed);
-    let e = sum_re.exp();
-    // im is always a multiple of π (0, π, 2π, etc.)
-    // Odd multiples → negative, even → positive
-    let n = (sum_im * std::f64::consts::FRAC_1_PI).round() as i64;
-    if n & 1 == 0 { e } else { -e }
-}
-
 /// Uncounted real exp with sign — used in hot loops where exp count is
 /// batch-added outside the loop. Branchless sign from im/π parity.
 #[inline(always)]

@@ -66,9 +66,12 @@ token costs 636\,K calls).  We then apply three optimization strategies
 grounded in abstract algebra---monoid-morphism factoring (Stepanov \&
 McJones, 2009), identity caching, and compile-time precomputation of
 $\ln W$---to build \textsc{emilio}, a Rust inference engine that runs
-Qwen2.5-0.5B\nobreakdash-Instruct (494\,M parameters) at 2.5~tokens/s
-on Apple~Silicon, producing correct English entirely through the EML
-primitive.
+Qwen2.5-0.5B\nobreakdash-Instruct (494\,M parameters) at
+$\sim$5.5~tokens/s on Apple~Silicon, producing correct English entirely
+through the EML primitive.  Speed is not the goal---anyone wanting fast
+inference should use \texttt{llama.cpp}---but rather demonstrating that a
+single algebraic identity suffices for every operation in a production
+transformer.
 
 We introduce two compiled model formats: EML~v1 (precomputed
 $\ln W$ as Complex64) and EML~v2 (sign\nobreakdash+magnitude encoding,
@@ -762,6 +765,10 @@ calls: even with 8-core Rayon parallelism, the $\sim$803{,}K
 transcendentals per token per matmul dominate.  The Apple M4~Max GPU
 offers 40 compute cores running at $\sim$1.4\,GHz with hardware
 \texttt{exp()} units, making it the natural target for EML workloads.
+The question is not whether the GPU can make EML \emph{fast}---for
+sheer speed, native matrix multiplies will always win---but whether
+EML purity can be maintained on massively parallel hardware while
+pushing throughput as far as the primitive allows.
 
 \subsection{Kernel Evolution}
 
@@ -814,10 +821,13 @@ operations are: addition (free), the scalar division by~$n$ and by~$2$
 \subsection{EML Purity Audit of Metal Shaders}
 
 Table~\ref{tab:gpu-audit} lists every Metal kernel and its EML
-compliance status.
+compliance status.  During the dead-code cleanup, superseded kernels
+(v1--v3 matmul, standalone add/norm, and the impure
+\texttt{eml\_silu\_mul}) were removed entirely; only the active,
+EML-pure kernels remain.
 
 \begin{table}[h]
-\caption{GPU kernel EML purity audit.}
+\caption{GPU kernel EML purity audit (active kernels only).}
 \label{tab:gpu-audit}
 \centering
 \small
@@ -825,20 +835,15 @@ compliance status.
 \toprule
 \textbf{Kernel} & \textbf{Status} & \textbf{Note} \\
 \midrule
-\texttt{eml\_matmul} (v1--v4)     & Pure EML & \texttt{exp(ln\_a + ln\_b) $\times$ sign} \\
+\texttt{eml\_matmul\_v4}            & Pure EML & SIMD + packed sign bits: \texttt{exp(ln\_a + ln\_b) $\times$ sign} \\
 \texttt{eml\_silu\_mul\_ln}        & Pure EML & ln-domain SiLU: $\ln|g| - \ln(1+e^{-g}) + \ln|u|$ \\
 \texttt{eml\_ln\_split}            & Pure EML & Decomposes to $\ln|x|$, $\mathrm{sign}(x)$ \\
-\texttt{eml\_add\_f32}             & Pure EML & Addition (free in EML) \\
-\texttt{eml\_rms\_norm\_ln\_split} & Pure EML & Eqs.~(\ref{eq:eml-sq})--(\ref{eq:eml-normsign}) \\
-\texttt{eml\_residual\_rms\_norm\_ln\_split} & Pure EML & Fused add + above \\
-\texttt{eml\_silu\_mul} (legacy)   & \textbf{impure} & Direct \texttt{g * sig}; \textbf{unused} \\
+\texttt{eml\_residual\_rms\_norm\_ln\_split} & Pure EML & Fused add + Eqs.~(\ref{eq:eml-sq})--(\ref{eq:eml-normsign}) \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The one impure kernel (\texttt{eml\_silu\_mul}) is dead code, superseded
-by the pure \texttt{eml\_silu\_mul\_ln}.  All active kernels pass the
-EML purity requirement.
+All active kernels pass the EML purity requirement.
 
 \subsection{GPU Correctness}
 

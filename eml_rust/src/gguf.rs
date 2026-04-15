@@ -11,7 +11,6 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
 
 // ─── GGUF constants ─────────────────────────────────────────────────────────
 

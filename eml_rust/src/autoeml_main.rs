@@ -487,7 +487,7 @@ fn cmd_verify(_args: &[String]) {
         let r_q = autoeml_kernel::kernel_fn(&a, &b_q, m, k, 896, &pc_q);
         let r_k = autoeml_kernel::kernel_fn(&a, &b_k, m, k, 128, &pc_k);
         let r_v = autoeml_kernel::kernel_fn(&a, &b_v, m, k, 128, &pc_v);
-        let (exp_no, ln_no) = autoeml_kernel::get_counts();
+        let (_exp_no, ln_no) = autoeml_kernel::get_counts();
 
         // With sharing: compute ln(X) once, pass to all three
         autoeml_kernel::reset_counts();
@@ -495,7 +495,7 @@ fn cmd_verify(_args: &[String]) {
         let r_q2 = autoeml_kernel::kernel_fn_with_ln_a(&a, &b_q, m, k, 896, &pc_q, Some(&ln_x));
         let r_k2 = autoeml_kernel::kernel_fn_with_ln_a(&a, &b_k, m, k, 128, &pc_k, Some(&ln_x));
         let r_v2 = autoeml_kernel::kernel_fn_with_ln_a(&a, &b_v, m, k, 128, &pc_v, Some(&ln_x));
-        let (exp_sh, ln_sh) = autoeml_kernel::get_counts();
+        let (_exp_sh, ln_sh) = autoeml_kernel::get_counts();
 
         let (ok_q, _) = autoeml_reference::allclose(&r_q, &r_q2, 1e-10, 1e-12);
         let (ok_k, _) = autoeml_reference::allclose(&r_k, &r_k2, 1e-10, 1e-12);

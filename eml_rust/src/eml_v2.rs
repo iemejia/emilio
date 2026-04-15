@@ -275,9 +275,6 @@ pub const DEFAULT_PRUNE_THRESHOLD: f64 = -30.0;
 pub fn compile_v2(weights: &ModelWeights, threshold: f64) -> V2ModelWeights {
     let cfg = &weights.config;
     let d = cfg.d_model;
-    let q_dim = cfg.n_heads * cfg.d_head;
-    let kv_dim = cfg.n_kv_heads * cfg.d_head;
-    let d_ff = cfg.d_ff;
 
     let mut total_params: usize = 0;
     let mut pruned_params: usize = 0;
@@ -413,8 +410,6 @@ fn v2_transformer_layer_one(
     pos: usize,
     kv: &mut LayerKVCache,
 ) -> Vec<f64> {
-    let d = cfg.d_model;
-
     // Pre-attention RMSNorm
     let normed = eml_rms_norm(x, &layer.attn_norm, cfg.rms_norm_eps);
 

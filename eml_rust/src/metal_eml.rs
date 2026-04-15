@@ -66,15 +66,6 @@ fn upload_f32(buf: &Buffer, data: &[f32]) {
     }
 }
 
-/// Compute ln(|x|) and sign(x) for each element, via EML.
-fn ln_split_cpu(a: &[f64]) -> (Vec<f32>, Vec<f32>) {
-    use crate::eml_ops::{to_c, eml_ln};
-    a.iter().map(|&v| {
-        let c = eml_ln(to_c(v));
-        (c.re as f32, if c.im.abs() < 1.0 { 1.0f32 } else { -1.0f32 })
-    }).unzip()
-}
-
 // ─── Metal context ──────────────────────────────────────────────────────────
 
 pub struct MetalContext {
@@ -83,8 +74,6 @@ pub struct MetalContext {
     pipe_matmul_v4: ComputePipelineState,
     pipe_silu_mul_ln: ComputePipelineState,
     pipe_ln_split: ComputePipelineState,
-    pipe_add_f32: ComputePipelineState,
-    pipe_rms_norm_ln: ComputePipelineState,
     pipe_residual_rms_norm_ln: ComputePipelineState,
 }
 
@@ -121,12 +110,10 @@ impl MetalContext {
         let pipe_matmul_v4 = make_pipe("eml_matmul_v4")?;
         let pipe_silu_mul_ln = make_pipe("eml_silu_mul_ln")?;
         let pipe_ln_split = make_pipe("eml_ln_split")?;
-        let pipe_add_f32 = make_pipe("eml_add_f32")?;
-        let pipe_rms_norm_ln = make_pipe("eml_rms_norm_ln_split")?;
         let pipe_residual_rms_norm_ln = make_pipe("eml_residual_rms_norm_ln_split")?;
 
         Ok(MetalContext { device, queue, pipe_matmul_v4, pipe_silu_mul_ln,
-            pipe_ln_split, pipe_add_f32, pipe_rms_norm_ln, pipe_residual_rms_norm_ln })
+            pipe_ln_split, pipe_residual_rms_norm_ln })
     }
 
     // ── Buffer helpers ──────────────────────────────────────────────
@@ -250,57 +237,6 @@ impl MetalContext {
         let grid = MTLSize::new(count as u64, 1, 1);
         let tg = MTLSize::new(count.min(256) as u64, 1, 1);
         enc.dispatch_threads(grid, tg);
-    }
-
-    // ── Encode add_f32 dispatch ─────────────────────────────────────
-
-    fn encode_add_f32(
-        &self,
-        enc: &ComputeCommandEncoderRef,
-        a: &Buffer,
-        b: &Buffer,
-        c: &Buffer,
-        count_buf: &Buffer,
-        count: usize,
-    ) {
-        enc.set_compute_pipeline_state(&self.pipe_add_f32);
-        enc.set_buffer(0, Some(a), 0);
-        enc.set_buffer(1, Some(b), 0);
-        enc.set_buffer(2, Some(c), 0);
-        enc.set_buffer(3, Some(count_buf), 0);
-
-        let grid = MTLSize::new(count as u64, 1, 1);
-        let tg = MTLSize::new(count.min(256) as u64, 1, 1);
-        enc.dispatch_threads(grid, tg);
-    }
-
-    // ── Encode rms_norm_ln_split dispatch ───────────────────────────
-
-    fn encode_rms_norm_ln_split(
-        &self,
-        enc: &ComputeCommandEncoderRef,
-        x: &Buffer,
-        gamma: &Buffer,
-        out_mag: &Buffer,
-        out_sign: &Buffer,
-        n_buf: &Buffer,
-        eps_buf: &Buffer,
-        n: usize,
-    ) {
-        enc.set_compute_pipeline_state(&self.pipe_rms_norm_ln);
-        enc.set_buffer(0, Some(x), 0);
-        enc.set_buffer(1, Some(gamma), 0);
-        enc.set_buffer(2, Some(out_mag), 0);
-        enc.set_buffer(3, Some(out_sign), 0);
-        enc.set_buffer(4, Some(n_buf), 0);
-        enc.set_buffer(5, Some(eps_buf), 0);
-
-        // 1 threadgroup for the whole norm, 256 threads cooperating
-        let nth = n.min(256) as u64;
-        let nsg = (nth + 31) / 32;
-        let tg = MTLSize::new(nth, 1, 1);
-        enc.set_threadgroup_memory_length(0, 32 * mem::size_of::<f32>() as u64);
-        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), tg);
     }
 
     // ── Encode fused residual_add + rms_norm + ln_split ─────────────

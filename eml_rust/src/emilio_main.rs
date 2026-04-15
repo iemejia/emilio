@@ -463,7 +463,7 @@ fn explore(gguf: &GGUFFile) {
         qkv_cse_per_tok / d, qkv_naive);
 
     // Attention: T² × d_head dot products per head
-    let attn_per_token = n_heads * d_head * 3; // per score: d_head muls
+    let _attn_per_token = n_heads * d_head * 3; // per score: d_head muls
     println!("    Attention:       T² × {} transcendentals per head × {n_heads} heads",
         d_head * 3);
 
@@ -476,7 +476,7 @@ fn explore(gguf: &GGUFFile) {
     println!("    RMSNorm:         T × ~{rms_per_tok} transcendentals (CSE on ln(x))");
 
     // LM head
-    let lm_head = d * v;
+    let _lm_head = d * v;
     println!("    LM head:         T × {} exp (CSE)", v);
 
     println!();

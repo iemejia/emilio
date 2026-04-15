@@ -404,50 +404,6 @@ impl KVCache {
     }
 }
 
-// ─── Full forward pass (prefill: process all tokens at once) ────────────────
-
-pub fn emilio_forward(
-    token_ids: &[usize],
-    weights: &ModelWeights,
-    rope: &RopeCache,
-) -> Vec<f64> {
-    let cfg = &weights.config;
-    let t = token_ids.len();
-    let d = cfg.d_model;
-
-    // 1. Token embedding (discrete lookup — not EML)
-    let mut x = vec![0.0f64; t * d];
-    for (i, &tok) in token_ids.iter().enumerate() {
-        x[i * d..(i + 1) * d].copy_from_slice(
-            &weights.token_embd[tok * d..(tok + 1) * d]
-        );
-    }
-
-    // 2. Transformer layers
-    for (layer_idx, layer) in weights.layers.iter().enumerate() {
-        x = transformer_layer(&x, layer, cfg, rope, t, layer_idx);
-    }
-
-    // 3. Final RMSNorm
-    let mut normed = Vec::with_capacity(t * d);
-    for i in 0..t {
-        normed.extend(eml_rms_norm(
-            &x[i * d..(i + 1) * d],
-            &weights.output_norm,
-            cfg.rms_norm_eps,
-        ));
-    }
-
-    // 4. LM head: (T, d_model) @ (d_model, vocab)
-    // Use precomputed ln(output_weight) transposed
-    let logits = build_matmul_cse_precomp(
-        &normed, &weights.ln_output,
-        t, d, cfg.vocab_size,
-    );
-
-    logits
-}
-
 // ─── Single-token forward pass with KV cache ───────────────────────────────
 
 /// Forward pass for a single new token, using KV cache for past context.
@@ -478,50 +434,6 @@ pub fn emilio_forward_one(
     build_matmul_cse_precomp(&normed, &weights.ln_output, 1, d, cfg.vocab_size)
 }
 
-fn transformer_layer(
-    x: &[f64],
-    layer: &LayerWeights,
-    cfg: &QwenConfig,
-    rope: &RopeCache,
-    t: usize,
-    _layer_idx: usize,
-) -> Vec<f64> {
-    let d = cfg.d_model;
-
-    // ── Pre-attention RMSNorm ──────────────────────────────────────
-    let mut normed = Vec::with_capacity(t * d);
-    for i in 0..t {
-        normed.extend(eml_rms_norm(
-            &x[i * d..(i + 1) * d],
-            &layer.attn_norm,
-            cfg.rms_norm_eps,
-        ));
-    }
-
-    // ── Attention ──────────────────────────────────────────────────
-    let attn_out = eml_gqa_attention(&normed, layer, cfg, rope, t);
-
-    // Residual add (0-cost in EML)
-    let mut x2 = eml_add_vec(x, &attn_out);
-
-    // ── Pre-FFN RMSNorm ────────────────────────────────────────────
-    let mut normed2 = Vec::with_capacity(t * d);
-    for i in 0..t {
-        normed2.extend(eml_rms_norm(
-            &x2[i * d..(i + 1) * d],
-            &layer.ffn_norm,
-            cfg.rms_norm_eps,
-        ));
-    }
-
-    // ── SwiGLU FFN ─────────────────────────────────────────────────
-    let ffn_out = eml_swiglu_ffn(&normed2, layer, cfg, t);
-
-    // Residual add
-    x2 = eml_add_vec(&x2, &ffn_out);
-    x2
-}
-
 // ─── Single-token transformer layer with KV cache ──────────────────────────
 
 fn transformer_layer_one(
@@ -532,8 +444,6 @@ fn transformer_layer_one(
     pos: usize,
     kv: &mut LayerKVCache,
 ) -> Vec<f64> {
-    let d = cfg.d_model;
-
     // Pre-attention RMSNorm
     let normed = eml_rms_norm(x, &layer.attn_norm, cfg.rms_norm_eps);
 
@@ -634,105 +544,6 @@ fn eml_gqa_attention_one(
 
     // Output projection
     build_matmul_cse_precomp(&out, &layer.ln_o, 1, q_dim, d)
-}
-
-// ─── GQA Attention (full sequence, for prefill) ─────────────────────────────
-
-fn eml_gqa_attention(
-    x: &[f64],
-    layer: &LayerWeights,
-    cfg: &QwenConfig,
-    rope: &RopeCache,
-    t: usize,
-) -> Vec<f64> {
-    let d = cfg.d_model;
-    let d_head = cfg.d_head;
-    let n_heads = cfg.n_heads;
-    let n_kv_heads = cfg.n_kv_heads;
-    let heads_per_kv = n_heads / n_kv_heads;
-
-    // QKV projections via precomputed ln(W) — no transpose or ln needed
-    let q_dim = n_heads * d_head;
-    let kv_dim = n_kv_heads * d_head;
-
-    let mut q = build_matmul_cse_precomp(x, &layer.ln_q, t, d, q_dim);
-    let mut k = build_matmul_cse_precomp(x, &layer.ln_k, t, d, kv_dim);
-    let mut v = build_matmul_cse_precomp(x, &layer.ln_v, t, d, kv_dim);
-
-    // Add bias (EML add — 0-cost, proven by cancellation)
-    for i in 0..t {
-        for j in 0..q_dim {
-            q[i * q_dim + j] = to_r(eml_add(to_c(q[i * q_dim + j]), to_c(layer.q_bias[j])));
-        }
-        for j in 0..kv_dim {
-            k[i * kv_dim + j] = to_r(eml_add(to_c(k[i * kv_dim + j]), to_c(layer.k_bias[j])));
-            v[i * kv_dim + j] = to_r(eml_add(to_c(v[i * kv_dim + j]), to_c(layer.v_bias[j])));
-        }
-    }
-
-    // Apply RoPE
-    for pos in 0..t {
-        for h in 0..n_heads {
-            let start = pos * q_dim + h * d_head;
-            rope.apply(&mut q[start..start + d_head], pos);
-        }
-        for h in 0..n_kv_heads {
-            let start = pos * kv_dim + h * d_head;
-            rope.apply(&mut k[start..start + d_head], pos);
-        }
-    }
-
-    // Attention scores + softmax + weighted sum, per head
-    let mut out = vec![0.0f64; t * d];
-    let scale = to_r(eml_inv(eml_sqrt(to_c(d_head as f64))));
-
-    for h in 0..n_heads {
-        let kv_h = h / heads_per_kv;
-
-        for i in 0..t {
-            // Compute scores[j] = dot(Q[h,i,:], K[kv_h,j,:]) * scale
-            let mut scores = Vec::with_capacity(t);
-            for j in 0..t {
-                if j > i {
-                    scores.push(-1e9_f64); // causal mask
-                } else {
-                    let mut dot = Complex64::new(0.0, 0.0);
-                    for dd in 0..d_head {
-                        let qv = q[i * q_dim + h * d_head + dd];
-                        let kv = k[j * kv_dim + kv_h * d_head + dd];
-                        dot = eml_add(dot, eml_mul(to_c(qv), to_c(kv)));
-                    }
-                    scores.push(to_r(eml_mul(dot, to_c(scale))));
-                }
-            }
-
-            // Softmax (CSE-optimized)
-            let attn_w = build_softmax_cse(&scores);
-
-            // Weighted sum over V
-            for dd in 0..d_head {
-                let mut acc = Complex64::new(0.0, 0.0);
-                for j in 0..t {
-                    let vv = v[j * kv_dim + kv_h * d_head + dd];
-                    acc = eml_add(acc, eml_mul(to_c(attn_w[j]), to_c(vv)));
-                }
-                out[i * d + h * d_head + dd] = to_r(acc);
-            }
-        }
-    }
-
-    // Output projection — use precomputed ln(o_weight)
-    build_matmul_cse_precomp(&out, &layer.ln_o, t, q_dim, d)
-}
-
-fn transpose(data: &[f64], rows: usize, cols: usize) -> Vec<f64> {
-    let mut out = vec![0.0f64; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            out[c * rows + r] = data[r * cols + c];
-        }
-    }
-    out
 }
 
 // ─── SwiGLU FFN ─────────────────────────────────────────────────────────────
@@ -971,22 +782,6 @@ pub mod gpu {
 
         // Output projection moved to batch_o_to_ffn — return pre-O weighted output
         out
-    }
-
-    fn swiglu_ffn_gpu(
-        x: &[f64],
-        _layer: &LayerWeights,
-        gpu_layer: &crate::metal_eml::GpuLayerWeights,
-        ctx: &MetalContext,
-        pool: &ScratchPool,
-        cfg: &QwenConfig,
-    ) -> Vec<f64> {
-        let d = cfg.d_model;
-        let d_ff = cfg.d_ff;
-
-        // Fused FFN: gate+up matmuls → silu_mul_ln → down matmul, all on GPU.
-        // Eliminates CPU silu + eml_mul_vec round-trip.
-        ctx.batch_ffn_fused(pool, x, &gpu_layer.gate, &gpu_layer.up, &gpu_layer.down, d, d_ff)
     }
 
     /// GPU-accelerated generation with KV cache.

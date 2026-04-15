@@ -6,7 +6,6 @@
 use egg::RecExpr;
 use eml_rust_core::*;
 use eml_rust_core::model::*;
-use eml_rust_core::eml_optimizer::*;
 use std::process;
 
 fn main() {
