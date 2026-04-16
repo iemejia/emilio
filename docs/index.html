@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>One Primitive: Convolution on Apple's Neural Engine</title>
+  <title>Transformer Inference on Apple's Neural Engine via Convolution</title>
 
   <!-- Open Graph -->
   <meta property="og:type" content="article">
-  <meta property="og:title" content="One Primitive: Running a Transformer and Game of Life on Apple's Neural Engine via Convolution">
-  <meta property="og:description" content="Both Conway's Game of Life and Qwen 2.5-0.5B compile to the same instruction: convolution on the ANE's 16-core engine. 171 tok/s, 19× improvement.">
+  <meta property="og:title" content="Transformer Inference on Apple's Neural Engine via Convolution">
+  <meta property="og:description" content="Qwen 2.5-0.5B running entirely on the ANE — every matmul is a Conv2d(1×1). 171 tok/s, no GPU. 19× from baseline through four optimizations.">
   <meta property="og:image" content="https://videlalvaro.github.io/emilio/og-card.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
@@ -16,8 +16,8 @@
 
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="One Primitive: Convolution on Apple's Neural Engine">
-  <meta name="twitter:description" content="Game of Life + Transformer inference on the same ANE convolution engine. 171 tok/s from one primitive.">
+  <meta name="twitter:title" content="Transformer Inference on Apple's Neural Engine via Convolution">
+  <meta name="twitter:description" content="Every matmul is a Conv2d(1×1). Qwen 2.5-0.5B at 171 tok/s on the ANE, no GPU.">
   <meta name="twitter:image" content="https://videlalvaro.github.io/emilio/og-card.png">
   <style>
     :root {
@@ -297,9 +297,9 @@
 <div class="container">
 
 <header>
-  <h1>One Primitive: Running a Transformer and Game of Life on Apple&rsquo;s Neural Engine via Convolution</h1>
+  <h1>Transformer Inference on Apple&rsquo;s Neural Engine via Convolution</h1>
   <p class="subtitle">
-    Both Conway&rsquo;s Game of Life and Qwen&nbsp;2.5&#8209;0.5B compile to the same instruction: convolution on the ANE&rsquo;s 16&#8209;core engine.
+    Qwen&nbsp;2.5&#8209;0.5B running <em>entirely</em> on the ANE &mdash; every matrix multiply is a <code>Conv2d(1&times;1)</code>. 171&nbsp;tok/s, no GPU.
   </p>
   <p class="meta">Alvaro Videla &middot; April 2026 &middot; <a href="https://github.com/videlalvaro/emilio">Source code</a></p>
 </header>
@@ -324,50 +324,8 @@
 </p>
 
 <p>
-  This project demonstrates that <strong>convolution alone</strong> is a sufficient primitive to implement two seemingly different computations on the same silicon:
+  Most LLM inference engines ignore the ANE entirely. This project shows that a transformer can run on it with <strong>zero approximation</strong>&mdash;by expressing every matrix multiplication as a <code>Conv2d(1&times;1)</code> convolution.
 </p>
-
-<ol>
-  <li><strong>Conway&rsquo;s Game of Life</strong> &mdash; a cellular automaton where each generation is a <code>Conv2d(3&times;3)</code> counting neighbors, followed by ReLU-based rule evaluation.</li>
-  <li><strong>Transformer inference</strong> &mdash; a full Qwen&nbsp;2.5&#8209;0.5B language model where every matrix multiplication is a <code>Conv2d(1&times;1)</code> operation.</li>
-</ol>
-
-<p>
-  The connection is not metaphorical. Both computations compile to the same ANE instruction stream: convolution kernels dispatched to the same 16-core engine.
-</p>
-
-<!-- ════════════ GOL ════════════ -->
-
-<h2>Game of Life as Convolution</h2>
-
-<p>
-  Conway&rsquo;s Game of Life operates on a binary grid. The rules depend on alive-neighbor count: birth (exactly&nbsp;3), survival (2&nbsp;or&nbsp;3), death (otherwise).
-  We encode one generation as a single convolution with a carefully chosen kernel:
-</p>
-
-<div class="equation">
-K = [[1, 1, 1],<br>
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[1, <span class="highlight">9</span>, 1],<br>
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[1, 1, 1]]
-</div>
-
-<p>
-  The center weight&nbsp;<code>9</code> encodes the cell&rsquo;s own state into the output, separating dead cells (sum&nbsp;0&ndash;8) from alive cells (sum&nbsp;9&ndash;17) into non-overlapping integer ranges. This enables branchless rule evaluation via ReLU:
-</p>
-
-<div class="equation">
-eq(s, k) = relu(1 &minus; (relu(s &minus; k) + relu(k &minus; s)))<br><br>
-alive&prime; = clamp(eq(s, 3) + eq(s, 11) + eq(s, 12), 0, 1)
-</div>
-
-<p>
-  Where <code>s=3</code> is birth, <code>s=11</code> is survival with 2 neighbors, and <code>s=12</code> is survival with 3. The entire generation is one conv + a few ReLU ops &mdash; natively accelerated on the ANE.
-</p>
-
-<figure class="gif-container">
-  <img src="emilio/conv-ane/gifs/gol_evolution.gif" alt="Gosper glider gun evolving on a 64×80 grid">
-  <figcaption>Gosper glider gun evolving via Conv2d(3&times;3) + ReLU rule evaluation. Each frame is one ANE forward pass. 2.3 billion cell-generations per second on a 1024&times;1024 grid.</figcaption>
-</figure>
 
 <!-- ════════════ Transformer ════════════ -->
 
@@ -461,18 +419,26 @@ y<sub>i</sub> = &sum;<sub>j</sub> W<sub>ij</sub> &middot; x<sub>j</sub>
   <figcaption>One token flowing through 24 layers &times; 7 operations = 168 convolutions + LM head. Each cell is one Conv2d(1&times;1) dispatch. Total: 5.67ms.</figcaption>
 </figure>
 
-<!-- ════════════ The Punchline ════════════ -->
+<!-- ════════════ Aside: GOL ════════════ -->
 
-<h2>The Punchline</h2>
+<h2>Aside: Convolution as a Universal Primitive</h2>
 
 <p>
-  The Game of Life uses <code>Conv2d(3&times;3)</code>. The transformer uses <code>Conv2d(1&times;1)</code>.
-  Both run on the same 16-core convolution engine. Same silicon, same primitive, two completely different computations.
+  The same ANE convolution engine can also run Conway&rsquo;s Game of Life. One generation encodes as a single <code>Conv2d(3&times;3)</code> with center weight&nbsp;9, separating dead (0&ndash;8) from alive (9&ndash;17). ReLU implements the rules branchless. 2.3&nbsp;billion cell-generations/sec on a 1024&times;1024 grid.
+</p>
+
+<figure class="gif-container">
+  <img src="emilio/conv-ane/gifs/gol_evolution.gif" alt="Gosper glider gun evolving on a 64×80 grid">
+  <figcaption>Gosper glider gun evolving via Conv2d(3&times;3) + ReLU. Each frame is one ANE forward pass.</figcaption>
+</figure>
+
+<p>
+  <code>Conv2d(3&times;3)</code> for a cellular automaton, <code>Conv2d(1&times;1)</code> for a transformer. Same 16-core engine, different kernel sizes, completely different computations.
 </p>
 
 <figure class="gif-container">
   <img src="emilio/conv-ane/gifs/split_screen.gif" alt="GOL and transformer running on the same ANE convolution engine">
-  <figcaption>Left: Game of Life evolving via 3&times;3 convolution. Right: transformer generating text via 1&times;1 convolution. Center: the ANE&rsquo;s 16-core engine running both.</figcaption>
+  <figcaption>Left: Game of Life via 3&times;3 convolution. Right: transformer generating text via 1&times;1 convolution. Both on the ANE.</figcaption>
 </figure>
 
 <div class="key-figure">
