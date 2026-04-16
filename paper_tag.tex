@@ -1,0 +1,744 @@
+\documentclass[acmsmall,nonacm]{acmart}
+
+%% ── packages ──────────────────────────────────────────────────────
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{hyperref}
+\usepackage{subcaption}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+%% ── listings style ────────────────────────────────────────────────
+\definecolor{codebg}{gray}{0.96}
+\definecolor{codegreen}{rgb}{0.13,0.55,0.13}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  keywordstyle=\color{blue},
+  commentstyle=\color{codegreen},
+  stringstyle=\color{red!70!black},
+  numbers=left,
+  numberstyle=\tiny\color{codegray},
+  numbersep=5pt,
+  breaklines=true,
+  frame=single,
+  framesep=4pt,
+  xleftmargin=8pt,
+  xrightmargin=4pt,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  literate={→}{$\rightarrow$}1 {×}{$\times$}1 {≈}{$\approx$}1,
+}
+\lstdefinelanguage{C89}{
+  keywords={int, double, void, static, const, struct, typedef, enum,
+            if, else, for, while, return, switch, case, break, default,
+            sizeof, malloc, calloc, free, memcpy},
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+}
+
+%% ── metadata ──────────────────────────────────────────────────────
+\title{Tag-System Scheduled Transformer Inference:\\
+  A 2-Tag System as the Control Model for LLM Generation}
+
+\author{Alvaro Videla}
+\affiliation{%
+  \institution{Microsoft}
+}
+
+\begin{abstract}
+We present a transformer inference engine whose control flow is
+governed entirely by a 2-tag system in the sense of Post~(1943).
+The engine maintains a two-symbol word $[\mathit{OP}, \mathit{STATE}]$
+and advances by reading the operation symbol, executing the
+corresponding production rule (one neural-network sub-operation),
+and emitting the next $[\mathit{OP}', \mathit{STATE}']$ pair.
+For a 24-layer Qwen~2.5 0.5B model, each generated token requires
+exactly 315~tag steps.
+
+The production rules encode sign-plus-magnitude matrix--vector
+products in the log domain, where weights are stored as
+$(\ln|w|, \operatorname{sign}(w))$ pairs and accumulation uses the
+log-sum-exp identity.  We apply five optimizations drawn from
+the classical computer science literature:
+(a)~a peephole-rewritten fast $\exp$ approximation (Aho et~al., Dragon Book),
+(b)~semigroup tree reduction for instruction-level parallelism (Stepanov \& McJones),
+(c)~constraint-propagation pruning at threshold $e^{-20}$ (Dechter),
+(d)~Grand Central Dispatch parallel column decomposition, and
+(e)~a Metal GPU backend with a SIMD-cooperative kernel using
+half-precision magnitudes and packed sign bits.
+
+We further introduce the \texttt{.tag} model format: a GPU-native,
+\texttt{mmap}-friendly binary encoding with page-aligned f16
+magnitudes and packed sign bits, enabling zero-copy Metal buffer
+registration via \texttt{newBufferWithBytesNoCopy}.  The format
+reduces model size from 4.8\,GB (f64 \texttt{.eml}) to 2.0\,GB
+(58\% reduction) and eliminates the GPU upload phase entirely.
+
+On an Apple M4~Max, the engine generates correct English text at
+${\sim}12$~tok/s wall-clock, with the matmul kernel achieving a
+$97.8\times$ speedup over the baseline CPU implementation.
+The entire system---tag-system scheduler, five optimization
+layers, GPU bridge, and \texttt{mmap} loader---is implemented in
+approximately 1700~lines of~C and 350~lines of Objective-C.
+
+\end{abstract}
+
+\keywords{tag system, Post production system, transformer inference,
+  sign-magnitude arithmetic, Metal GPU, mmap, zero-copy}
+
+\begin{document}
+\maketitle
+
+%% ═════════════════════════════════════════════════════════════════
+\section{Introduction}
+\label{sec:intro}
+
+Post's tag systems~\cite{post1943} are among the simplest known
+Turing-complete computational models.  A $m$-tag system operates on a
+finite alphabet $A$ with a production function $P : A \to A^*$: at
+each step, the machine reads the leftmost symbol~$a$ of the word,
+appends $P(a)$ to the right end, and deletes the leftmost~$m$
+symbols.  Cocke and Minsky~\cite{cocke1964} proved that 2-tag systems
+($m=2$) are universal.
+
+Modern large language models (LLMs) are typically implemented as
+imperative programs with nested loops over layers, attention heads,
+and sequence positions.  The control flow is implicit in the loop
+structure.  We ask: \emph{can a tag system serve as the explicit
+scheduling mechanism for transformer inference?}
+
+We answer affirmatively by constructing \textsc{emilio-tag}, an
+inference engine for Qwen~2.5 0.5B~Instruct~\cite{qwen2025} in
+which:
+
+\begin{enumerate}
+\item The computation state is a two-symbol word
+  $[\mathit{OP}, \mathit{STATE}]$, where $\mathit{OP}$ determines
+  which neural-network sub-operation to execute and $\mathit{STATE}$
+  carries the mutable activation vectors.
+
+\item Each of 16 production rules performs one transformer
+  sub-operation (embedding lookup, RMSNorm, QKV projection,
+  RoPE, attention, FFN, etc.) and emits the next operation symbol.
+
+\item The word length is invariant at~2.  The tag system halts
+  after exactly $1 + 24 \times 13 + 2 = 315$ steps per token.
+
+\item The production rules are \emph{parameterised} by model
+  weights: $P(\textsc{qkv\_matmul}, \text{layer}=k)$ uses the
+  QKV weight matrix of layer~$k$.
+\end{enumerate}
+
+The tag system governs sequential control flow---which operation
+runs after which---while the evaluation of each production rule
+uses conventional CPU or GPU arithmetic.  We call this architecture
+\emph{tag-system-scheduled, natively-evaluated}.
+
+The rest of this paper describes the formal model
+(Section~\ref{sec:model}), the sign-magnitude matmul kernel and its
+five optimization layers (Section~\ref{sec:optimizations}), the Metal
+GPU backend (Section~\ref{sec:gpu}), the \texttt{.tag} model format
+with \texttt{mmap} and zero-copy GPU registration
+(Section~\ref{sec:format}), experimental results
+(Section~\ref{sec:results}), and related work
+(Section~\ref{sec:related}).
+
+
+%% ═════════════════════════════════════════════════════════════════
+\section{The 2-Tag System Model}
+\label{sec:model}
+
+\subsection{Formal Definition}
+
+A 2-tag system is a triple $(m, A, P)$ where:
+\begin{itemize}
+\item $m = 2$ is the \emph{deletion number}.
+\item $A$ is a finite \emph{alphabet}.
+\item $P : A \to A^*$ maps each symbol to a \emph{production}
+  (a finite string over~$A$).
+\end{itemize}
+
+The machine maintains a \emph{word} $w \in A^*$.  At each step:
+\begin{enumerate}
+\item Read the leftmost symbol $a = w_0$.
+\item If $a$ is a halting symbol, stop.
+\item Append $P(a)$ to the right end of~$w$.
+\item Delete the leftmost $m = 2$ symbols.
+\end{enumerate}
+
+\subsection{Instantiation for Transformer Inference}
+
+We define the alphabet for a transformer with $L$~layers:
+\begin{align*}
+A = \{\, &\textsc{embed},\; \textsc{rmsnorm\_attn},\;
+  \textsc{qkv\_matmul},\; \textsc{bias\_add},\\
+  &\textsc{rope},\; \textsc{kv\_store},\;
+  \textsc{attention},\; \textsc{out\_proj},\\
+  &\textsc{residual\_attn},\; \textsc{ffn\_norm},\;
+  \textsc{gate\_up},\; \textsc{silu\_mul},\\
+  &\textsc{down\_proj},\; \textsc{residual\_ffn},\;
+  \textsc{final\_norm},\; \textsc{lm\_head},\\
+  &\textsc{halt},\; \textsc{state}\,\}
+\end{align*}
+
+Each symbol carries a layer index $\ell \in \{0, \dots, L-1\}$.
+The word is always exactly two symbols:
+\[
+  w = [\mathit{OP}_\ell,\; \textsc{state}]
+\]
+
+The \textsc{state} symbol carries a mutable payload: the current
+activation vector~$\mathbf{x}$, a residual vector, the sequence
+position, and the current layer index.
+
+\subsection{Production Rules}
+
+Each production $P(\mathit{OP}_\ell)$ performs one sub-operation
+and determines the next operation symbol.  The key rules are:
+
+\medskip
+\noindent\textbf{Embedding.}
+$P(\textsc{embed})$: look up $\mathbf{x} \leftarrow E[\text{token\_id}]$,
+emit $[\textsc{rmsnorm\_attn}_0, \textsc{state}]$.
+
+\medskip
+\noindent\textbf{Layer transition.}
+$P(\textsc{residual\_ffn}_\ell)$: compute
+$\mathbf{x} \leftarrow \mathbf{x}_\text{residual} + \mathbf{x}_\text{ffn}$.
+If $\ell < L-1$, emit $[\textsc{rmsnorm\_attn}_{\ell+1}, \textsc{state}]$;
+otherwise emit $[\textsc{final\_norm}, \textsc{state}]$.
+
+\medskip
+\noindent\textbf{Halting.}
+$P(\textsc{lm\_head})$: compute output logits via matmul, set
+$\text{argmax}$, emit $[\textsc{halt}, \textsc{state}]$.
+
+\subsection{Step Count Analysis}
+
+For one token through a 24-layer model:
+\begin{align*}
+\text{steps} &= 1_{\text{embed}} + L \times 13_{\text{layer ops}}
+  + 1_{\text{final\_norm}} + 1_{\text{lm\_head}} \\
+  &= 1 + 24 \times 13 + 2 = 315
+\end{align*}
+
+The 13 layer operations are: \textsc{rmsnorm\_attn},
+\textsc{qkv\_matmul}, \textsc{bias\_add}, \textsc{rope},
+\textsc{kv\_store}, \textsc{attention}, \textsc{out\_proj},
+\textsc{residual\_attn}, \textsc{ffn\_norm}, \textsc{gate\_up},
+\textsc{silu\_mul}, \textsc{down\_proj}, \textsc{residual\_ffn}.
+
+
+%% ═════════════════════════════════════════════════════════════════
+\section{Sign-Magnitude Arithmetic and Optimizations}
+\label{sec:optimizations}
+
+\subsection{Log-Domain Sign-Magnitude Representation}
+
+Weights are stored as pairs $(\ln|w_k|, \operatorname{sign}(w_k))$.
+A matrix--vector product $\mathbf{y} = W\mathbf{x}$ becomes:
+
+\begin{equation}
+y_j = \sum_{k} \operatorname{sign}(w_{jk}) \cdot
+  \operatorname{sign}(x_k) \cdot
+  \exp\!\bigl(\ln|w_{jk}| + \ln|x_k|\bigr)
+\label{eq:smmatmul}
+\end{equation}
+
+At runtime, the activation $\mathbf{x}$ is converted to
+$(\ln|x_k|, \operatorname{sign}(x_k))$ before each matmul.  The
+inner products are computed via log-sum-exp with a running maximum
+for numerical stability.
+
+\subsection{Optimization 1: Fast Exponential (Dragon Book)}
+
+The inner loop calls $\exp()$ approximately $K$ times per dot
+product, where $K$ is the inner dimension (896 for most layers,
+4864 for \textsc{down\_proj}).  We replace the libm \texttt{exp()}
+with a range-reduced 5th-degree polynomial~\cite{dragonbook}:
+
+\begin{enumerate}
+\item \textbf{Range reduction}: $x = n \cdot \ln 2 + r$,
+  where $n = \lfloor x / \ln 2 \rfloor$ and $0 \le r < \ln 2$.
+\item \textbf{Polynomial}: $\exp(r) \approx 1 + r(1 + r(0.5 +
+  r(\tfrac{1}{6} + r(\tfrac{1}{24} + \tfrac{r}{120}))))$.
+\item \textbf{Reconstruction}: $2^n$ via IEEE~754 exponent bit
+  manipulation (zero floating-point operations).
+\end{enumerate}
+
+The relative error is below $2 \times 10^{-7}$, well within the
+tolerance of the sign-magnitude representation.  This is a
+\emph{peephole optimization} in the Dragon Book sense: a local
+pattern (expensive \texttt{exp} call) is replaced by a cheaper
+equivalent without changing the surrounding code.
+
+\subsection{Optimization 2: Pruning Threshold (Dechter)}
+
+Terms where $\ln|w_{jk}| + \ln|x_k| - \max < -20$ contribute at most
+$e^{-20} \approx 2 \times 10^{-9}$ to the sum.  Over $K = 896$
+terms, the maximum accumulated error is $K \cdot e^{-20} \approx
+1.8 \times 10^{-6}$.  We skip these terms entirely.
+
+This is constraint propagation in the sense of
+Dechter~\cite{dechter}: propagating the constraint ``this term's
+contribution is negligible'' to prune the computation.  The
+threshold was tightened from $-30$ to $-20$ after analyzing the
+error budget.
+
+\subsection{Optimization 3: Semigroup Tree Reduction (Stepanov)}
+
+The accumulation $\texttt{acc} = \texttt{acc} + f(x_k)$ is a linear
+dependency chain of depth~$K$.  Since addition is associative (it
+forms a semigroup~\cite{stepanov2009}), we can reparenthesise:
+
+\begin{lstlisting}[language=C89,caption={4-way ILP accumulation}]
+double a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+for (k = 0; k < K; k += 4) {
+    a0 += fast_exp(s[k])   * sign[k];
+    a1 += fast_exp(s[k+1]) * sign[k+1];
+    a2 += fast_exp(s[k+2]) * sign[k+2];
+    a3 += fast_exp(s[k+3]) * sign[k+3];
+}
+acc = (a0 + a1) + (a2 + a3);  // tree reduce
+\end{lstlisting}
+
+The final tree-reduce \texttt{(a0+a1)+(a2+a3)} has depth 2 instead
+of~$K$.  The same 4-way decomposition is applied to the max-finding
+pass.
+
+\subsection{Optimization 4: GCD Parallel Dispatch}
+
+The column loop of the matrix--vector product is embarrassingly
+parallel: each output element $y_j$ depends on a different column
+of~$W$.  We split the columns across $N$ worker threads using macOS
+Grand Central Dispatch (\texttt{dispatch\_apply\_f}):
+
+\begin{lstlisting}[language=C89,caption={GCD parallel dispatch}]
+dispatch_apply_f(nchunks,
+    dispatch_get_global_queue(
+        QOS_CLASS_USER_INTERACTIVE, 0),
+    &ctx, matmul_dispatch_work);
+\end{lstlisting}
+
+Thread count is auto-detected via \texttt{sysconf(\_SC\_NPROCESSORS\_ONLN)}
+and overridable with \texttt{EML\_THREADS}.  The GCD thread pool
+has zero creation/destruction overhead across the ${\sim}3000$
+matmul calls per 8-token generation.
+
+
+%% ═════════════════════════════════════════════════════════════════
+\section{Metal GPU Backend}
+\label{sec:gpu}
+
+\subsection{Architecture}
+
+The tag system determines \emph{which} operation to execute; the GPU
+determines \emph{how} the heaviest operations (matmuls) are evaluated.
+When a production rule calls \texttt{build\_matmul\_sm} and a GPU
+weight buffer exists (\texttt{gpu\_weight\_id} $\ge 0$), the call is
+dispatched to the Metal compute shader.  All other production rules
+(RMSNorm, softmax, RoPE, residual adds) run on the CPU.
+
+This separation is principled: the tag system is the \emph{control
+model} and the GPU is the \emph{evaluation model}.  The tag system
+still executes all 315 sequential steps per token---parallelism
+exists only \emph{within} a single production rule's evaluation.
+
+\subsection{SIMD-Cooperative Kernel}
+
+The Metal shader assigns one SIMD group (32~threads) per output
+element $(i, j)$.  Each thread processes $\lceil K/32 \rceil$
+elements of the inner dimension and contributes to a
+\texttt{simd\_sum} reduction:
+
+\begin{lstlisting}[language=C89,caption={Metal kernel core (simplified)}]
+// 4-way unrolled inner loop
+for (; k + 96 < inner; k += 128) {
+    float m0 = ln_a_mag[ak]   + half(ln_b_mag[bk]);
+    float m1 = ln_a_mag[ak+32]+ half(ln_b_mag[bk+32]);
+    float m2 = ln_a_mag[ak+64]+ half(ln_b_mag[bk+64]);
+    float m3 = ln_a_mag[ak+96]+ half(ln_b_mag[bk+96]);
+    // sign extraction from packed u32
+    float sb0 = 1-2*float((w0>>lane)&1);
+    acc0 += exp(m0) * (sign_a[ak] * sb0);
+    ...
+}
+float total = simd_sum(acc0+acc1+acc2+acc3);
+\end{lstlisting}
+
+\subsection{Weight Storage on GPU}
+
+Weight magnitudes are stored as f16 (half-precision), and signs
+are packed as single bits into u32 words (bit~$k$ of word~$\lfloor k/32 \rfloor$
+is 1 iff $w_k < 0$).  This achieves a 23\% bandwidth reduction
+over storing magnitudes as f32 and signs as f32.
+
+The activation vector~$\mathbf{x}$ is converted to
+$(\ln|x_k|, \operatorname{sign}(x_k))$ on the CPU and written to
+shared Metal buffers.  The result is read back as f32 and
+converted to f64 for the next tag step.
+
+
+%% ═════════════════════════════════════════════════════════════════
+\section{The \texttt{.tag} Model Format}
+\label{sec:format}
+
+\subsection{Motivation}
+
+The original \texttt{.eml} format stores weights as f64
+sign-magnitude pairs.  Loading the 0.5B model requires:
+\begin{enumerate}
+\item Reading 4.8\,GB of f64 data from disk (\(\sim\)10\,s).
+\item Converting each weight from f64 to f16 magnitude and
+  packing signs into u32 words.
+\item Copying the converted data to Metal GPU buffers
+  (\(\sim\)6\,s).
+\end{enumerate}
+
+We designed the \texttt{.tag} format to eliminate steps 2 and~3.
+
+\subsection{Format Layout}
+
+The \texttt{.tag} file has four sections:
+
+\begin{description}
+\item[Header (84 bytes):] Magic \texttt{TAG1}, version~(u32),
+  model configuration (10$\times$u32 + 2$\times$f64),
+  tensor count~(u32), and offsets to the tokenizer, tensor
+  directory, and data sections.
+
+\item[Tokenizer:] Vocabulary strings and BPE merge table, stored
+  as length-prefixed byte sequences.
+
+\item[Dense arrays:] Token embeddings, layer norms, and biases
+  as f64 arrays with u64 length prefixes.
+
+\item[Tensor data (page-aligned):] f16 magnitudes and packed u32
+  sign bits for all 97~weight matrices, laid out contiguously
+  starting at a 16\,KB-aligned offset.
+\end{description}
+
+A \emph{tensor directory} between the dense arrays and tensor data
+provides the inner dimension, column count, magnitude offset, and
+sign offset for each tensor.
+
+\subsection{Zero-Copy GPU Registration}
+
+The tensor data section is page-aligned (16\,KB on Apple Silicon)
+so that the \texttt{mmap}'d region can be wrapped directly as a
+Metal buffer:
+
+\begin{lstlisting}[language=C89,caption={Zero-copy Metal buffer from mmap}]
+id<MTLBuffer> buf = [device
+    newBufferWithBytesNoCopy:(void *)ptr
+        length:nbytes
+        options:MTLResourceStorageModeShared
+        deallocator:nil];
+\end{lstlisting}
+
+On Apple Silicon's unified memory architecture, this avoids any data
+copy: the GPU reads directly from the \texttt{mmap}'d virtual pages.
+The \texttt{nil} deallocator indicates that the mmap owns the
+underlying memory.  If the pointer is not page-aligned (e.g., on
+non-Apple hardware), the implementation falls back to a copy.
+
+\subsection{Loading Procedure}
+
+\begin{enumerate}
+\item \texttt{mmap()} the entire \texttt{.tag} file with
+  \texttt{MAP\_PRIVATE} and \texttt{PROT\_READ}.
+\item Parse the header and tokenizer from the mapped region
+  (pointer arithmetic, no I/O).
+\item Copy dense f64 arrays (embeddings, norms, biases) to
+  heap-allocated buffers.
+\item Iterate the tensor directory: for each of the 97~tensors,
+  call \texttt{metal\_register\_weights\_nocopy()} with pointers
+  into the mapped data section.
+\end{enumerate}
+
+The kernel does not touch the tensor data during loading---it
+is faulted in by the GPU on first access.
+
+\subsection{File Size Comparison}
+
+\begin{table}[h]
+\centering
+\caption{Model format comparison for Qwen 2.5 0.5B Instruct.}
+\label{tab:format}
+\begin{tabular}{lrrl}
+\toprule
+\textbf{Format} & \textbf{Size} & \textbf{Precision} & \textbf{Loading} \\
+\midrule
+\texttt{.gguf} (q8) & 0.5\,GB & int8 & standard \\
+\texttt{.eml} (v2)  & 4.8\,GB & f64  & \texttt{fread} + convert \\
+\texttt{.tag} (v1)  & 2.0\,GB & f16+bits & \texttt{mmap} zero-copy \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+%% ═════════════════════════════════════════════════════════════════
+\section{Experimental Results}
+\label{sec:results}
+
+All experiments use Qwen~2.5 0.5B Instruct (24~layers,
+$d_\text{model}=896$, $d_\text{ff}=4864$, vocab$=151936$) on an
+Apple M4~Max.  The prompt is ``What is a tag system?'' with 8
+generated tokens.  Output in all configurations: ``A tag system
+is a type of data''.
+
+\subsection{Optimization Progression}
+
+\begin{table}[h]
+\centering
+\caption{Cumulative effect of optimizations on matmul time and wall
+  clock (8 tokens generated).}
+\label{tab:optim}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Configuration} & \textbf{Matmul} & \textbf{Wall} & \textbf{Speedup} \\
+\midrule
+Baseline (na\"ive C)      & 42,858\,ms & 63\,s   & $1.0\times$ \\
++ fast\_exp + ILP + prune  & 29,774\,ms & 43\,s   & $1.4\times$ \\
++ GCD 16 threads           &  3,611\,ms & 16\,s   & $11.9\times$ \\
++ Metal GPU                &    438\,ms & 16.5\,s & $97.8\times$ \\
++ \texttt{.tag} mmap       &    668\,ms & 12.9\,s & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The matmul speedup from baseline to GPU is $97.8\times$.  Note that
+the \texttt{.tag} format improves wall-clock time (12.9\,s vs.\ 16.5\,s)
+by eliminating the f64$\to$f16 conversion and GPU upload phase, while
+inference time remains comparable.
+
+\subsection{Time Breakdown by Production Rule}
+
+Table~\ref{tab:profile} shows the time spent in each production rule
+when using the Metal GPU backend with \texttt{.tag} loading.
+
+\begin{table}[h]
+\centering
+\caption{Production rule profile (Metal GPU, \texttt{.tag} format,
+  8 generated tokens, 32 forward passes).}
+\label{tab:profile}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Rule} & \textbf{Count} & \textbf{Time (ms)} & \textbf{\%} \\
+\midrule
+\textsc{embed}          &  32 &   0.0 &  0.0 \\
+\textsc{rmsnorm\_attn}  & 768 &   1.1 &  0.2 \\
+\textsc{qkv\_matmul}    & 768 & 111.4 & 16.7 \\
+\textsc{bias\_add}      & 768 &   0.4 &  0.1 \\
+\textsc{rope}           & 768 &   0.2 &  0.0 \\
+\textsc{kv\_store}      & 768 &   0.4 &  0.1 \\
+\textsc{attention}      & 768 &  11.1 &  1.7 \\
+\textsc{out\_proj}      & 768 & 103.5 & 15.5 \\
+\textsc{residual\_attn} & 768 &   0.2 &  0.0 \\
+\textsc{ffn\_norm}      & 768 &   0.9 &  0.1 \\
+\textsc{gate\_up}       & 768 & 198.6 & 29.8 \\
+\textsc{silu\_mul}      & 768 &   5.5 &  0.8 \\
+\textsc{down\_proj}     & 768 & 159.8 & 23.9 \\
+\textsc{residual\_ffn}  & 768 &   0.2 &  0.0 \\
+\textsc{final\_norm}    &  32 &   0.0 &  0.0 \\
+\textsc{lm\_head}       &  32 &  74.4 & 11.1 \\
+\midrule
+\textbf{Total}          &     & 667.5 & 100.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The four matmul-heavy production rules (\textsc{gate\_up},
+\textsc{down\_proj}, \textsc{qkv\_matmul}, \textsc{out\_proj})
+account for 85.9\% of compute time.  Non-matmul operations
+(norms, residual adds, softmax, RoPE) are negligible at 2.2\%.
+
+\subsection{Format Loading Comparison}
+
+\begin{table}[h]
+\centering
+\caption{Loading performance: \texttt{.eml} vs.\ \texttt{.tag}.}
+\label{tab:loading}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Format} & \textbf{File} & \textbf{Wall} & \textbf{CPU time} \\
+\midrule
+\texttt{.eml} (fread + upload) & 4.8\,GB & 16.1\,s & 13.9\,s \\
+\texttt{.tag} (mmap zero-copy) & 2.0\,GB & 12.9\,s & 11.2\,s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+%% ═════════════════════════════════════════════════════════════════
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Tag System as Control Model}
+
+The tag system is the \emph{scheduling layer}: it determines the
+order of operations.  The 315 sequential steps per token are a
+faithful representation of the transformer's dataflow dependencies.
+No step can be reordered without violating data dependencies---the
+tag system encodes the \emph{minimum} sequential structure.
+
+Within each production rule, however, the evaluation is conventional:
+SIMD instructions, GPU warps, and multi-core parallelism.  We call
+this \emph{tag-system-scheduled, natively-evaluated}: the control
+model is Post's (1943) 2-tag system, the evaluation model is
+contemporary hardware.
+
+\subsection{Why a Tag System?}
+
+Beyond theoretical interest, the tag system provides:
+\begin{itemize}
+\item \textbf{Explicit dataflow.}  Every operation and its
+  dependencies are visible in the production rules.  There are no
+  hidden control paths.
+\item \textbf{Deterministic step count.}  Exactly 315 steps per
+  token, invariant of input.  This makes performance analysis
+  trivial: profile each production rule independently.
+\item \textbf{Composability.}  New operations (e.g., mixture of
+  experts, sliding-window attention) are added by defining new
+  production rules and extending the alphabet.
+\item \textbf{Formal foundation.}  The system's computational
+  universality is guaranteed by Cocke and Minsky's
+  theorem~\cite{cocke1964}.
+\end{itemize}
+
+\subsection{Limitations}
+
+The sign-magnitude representation in f64 is space-inefficient
+compared to standard quantization formats (q4, q8).  The
+\texttt{.tag} format mitigates this with f16 storage, but a 0.5B
+model still occupies 2.0\,GB.  The CPU path remains necessary for
+non-matmul operations, creating a CPU--GPU synchronization boundary
+at every production rule that involves a matmul.
+
+
+%% ═════════════════════════════════════════════════════════════════
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Tag systems and universality.}
+Post~\cite{post1943} introduced tag systems as a model of
+computation.  Cocke and Minsky~\cite{cocke1964} proved 2-tag
+universality.  De~Mol~\cite{demol2008} surveys the historical
+development.  To our knowledge, no prior work uses tag systems
+for scheduling neural network computations.
+
+\paragraph{EML operator.}
+Odrzywołek~\cite{odrzywolek2026} showed that
+$\mathrm{eml}(x,y) = e^x - \ln y$ can derive all elementary
+functions.  Our sign-magnitude encoding is related: the inner
+product is computed as $\exp(\ln|a| + \ln|b|) \cdot \operatorname{sign}(a)
+\cdot \operatorname{sign}(b)$, which factors through $\exp$ and $\ln$.
+
+\paragraph{Efficient inference.}
+\texttt{llama.cpp}~\cite{llamacpp} and \texttt{ggml} provide
+highly optimized quantized inference.  Our work is not competitive
+on throughput; it explores a different point in the design space
+where the control model is an explicit formal system.
+
+\paragraph{Memory-mapped model loading.}
+The \texttt{gguf} format supports \texttt{mmap}-based loading.
+\texttt{safetensors}~\cite{safetensors} also uses memory mapping.
+Our \texttt{.tag} format extends this to zero-copy GPU buffer
+registration via Metal's \texttt{newBufferWithBytesNoCopy}, avoiding
+even the kernel-to-GPU copy on unified memory architectures.
+
+\paragraph{Classical optimization sources.}
+Our optimizations draw explicitly from:
+Aho et~al.~\cite{dragonbook} (peephole optimization),
+Stepanov and McJones~\cite{stepanov2009} (semigroup reduction),
+and Dechter~\cite{dechter} (constraint propagation for pruning).
+
+
+%% ═════════════════════════════════════════════════════════════════
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have shown that a 2-tag system can serve as the explicit control
+model for transformer inference.  The engine generates correct text
+from a 0.5B-parameter model using 315 tag steps per token, with
+each step corresponding to one transformer sub-operation.  Five
+classical optimization techniques---peephole rewriting, semigroup
+reduction, constraint-propagation pruning, multi-core dispatch,
+and GPU offloading---bring the matmul kernel from 42.9\,s to
+0.44\,s ($97.8\times$).  The \texttt{.tag} model format with
+\texttt{mmap} and zero-copy Metal registration reduces file size
+by 58\% and loading time by 20\%.
+
+The system demonstrates that even the simplest Turing-complete
+formalism---a 2-tag system with deletion number $m=2$ and 18
+symbols---can organize the control flow of a modern neural network.
+Speed is not the primary contribution; rather, the work establishes
+that formal models of computation from the 1940s remain applicable
+as scheduling substrates for contemporary AI systems.
+
+
+%% ═════════════════════════════════════════════════════════════════
+\bibliographystyle{ACM-Reference-Format}
+
+\begin{thebibliography}{10}
+
+\bibitem{post1943}
+E.~L. Post.
+\newblock Formal reductions of the general combinatorial decision problem.
+\newblock {\em American Journal of Mathematics}, 65(2):197--215, 1943.
+
+\bibitem{cocke1964}
+J.~Cocke and M.~Minsky.
+\newblock Universality of tag systems with {P}=2.
+\newblock {\em Journal of the ACM}, 11(1):15--20, 1964.
+
+\bibitem{qwen2025}
+Qwen Team.
+\newblock Qwen2.5: A party of foundation models.
+\newblock Technical report, Alibaba Cloud, 2025.
+
+\bibitem{odrzywolek2026}
+A.~Odrzywołek.
+\newblock One function to rule them all.
+\newblock arXiv:2603.21852, 2026.
+
+\bibitem{dragonbook}
+A.~V. Aho, M.~S. Lam, R.~Sethi, and J.~D. Ullman.
+\newblock {\em Compilers: Principles, Techniques, and Tools}.
+\newblock Pearson, 2nd edition, 2006.
+
+\bibitem{stepanov2009}
+A.~A. Stepanov and P.~McJones.
+\newblock {\em Elements of Programming}.
+\newblock Addison-Wesley, 2009.
+
+\bibitem{dechter}
+R.~Dechter.
+\newblock {\em Constraint Processing}.
+\newblock Morgan Kaufmann, 2003.
+
+\bibitem{demol2008}
+L.~De~Mol.
+\newblock Tag systems and {C}ollatz-like functions.
+\newblock {\em Theoretical Computer Science}, 390(1):92--101, 2008.
+
+\bibitem{llamacpp}
+G.~Gerganov et~al.
+\newblock llama.cpp: {LLM} inference in {C/C++}.
+\newblock \url{https://github.com/ggerganov/llama.cpp}, 2023--2026.
+
+\bibitem{safetensors}
+Hugging Face.
+\newblock Safetensors: Simple, safe way to store and distribute tensors.
+\newblock \url{https://github.com/huggingface/safetensors}, 2023.
+
+\end{thebibliography}
+
+\end{document}

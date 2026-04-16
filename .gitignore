@@ -36,3 +36,4 @@ Cargo.lock
 
 # MOV build artifacts
 emilio/mov/build/
+emilio/tag/build/
