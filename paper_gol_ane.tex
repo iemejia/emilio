@@ -50,15 +50,17 @@ evaluation, achieving 2.3~billion cell-generations per second on a
 %
 The Qwen2.5-0.5B transformer is mapped entirely to
 \texttt{Conv2d(1$\times$1)} operations, with every linear projection
-expressed as a 1$\times$1 convolution, achieving 90~tokens/sec decode
-throughput---within 4$\times$ of llama.cpp on Metal GPU, using a
+expressed as a 1$\times$1 convolution, achieving 171~tokens/sec decode
+throughput---within 2$\times$ of llama.cpp on Metal GPU, using a
 compute unit (ANE) that conventional LLM engines ignore.
 %
 Both systems share the same silicon: the ANE's 16-core convolution
 engine. We describe the algebraic encoding of GOL rules into
 convolution + ReLU, the transformer-to-convolution mapping, and a
-series of book-driven optimizations that improved decode throughput by
-10$\times$ from initial implementation to final system.
+series of optimizations---book-driven host elimination, pre-allocated
+buffers, fixed-shape compiled models, and CoreML stateful KV
+caching---that improved decode throughput by 19$\times$ from initial
+implementation to final system.
 \end{abstract}
 
 %% ════════════════════════════════════════════════════════════════════
@@ -509,6 +511,86 @@ Batching all 7 query heads per KV group into single matmuls reduced
 MIL operations from 4,569 to 4,399 and improved decode from 78 to
 90~tok/s.
 
+\subsection{Pre-allocated MLMultiArray Buffers}
+
+Profiling the flex-mode decode loop revealed that while ANE prediction
+dominated wall time, host-side buffer management still consumed
+$\sim$20\% due to per-call \texttt{MLMultiArray} allocation and KV
+cache copying through Objective-C subscript dispatch. Three changes
+eliminated this overhead:
+
+\begin{enumerate}
+\item \textbf{Hoisted allocations.} The input buffers \texttt{xArr},
+  \texttt{cosArr}, \texttt{sinArr} are allocated once before the
+  generation loop and overwritten in place via raw
+  \texttt{UnsafeMutablePointer<Float16>} each token.
+\item \textbf{Pointer-based KV cache.} Replaced \texttt{[Float16]}
+  arrays with \texttt{UnsafeMutablePointer<Float16>}, enabling zero-copy
+  strided \texttt{MLMultiArray} views directly into the cache.
+\item \textbf{memcpy write-back.} Replaced the per-element KV
+  extraction loop with a single \texttt{memcpy} per layer.
+\end{enumerate}
+
+Result: pack overhead dropped from $\sim$20\% to 0.4\% of the hot
+path; ANE prediction now accounts for 99.5\% of per-token time.
+
+\subsection{Fixed-Shape Compiled Model}
+
+CoreML's ANE compiler must plan the execution graph for each unique
+input shape.  In flex mode, the KV cache grows by one position each
+token, triggering replanning every call.  We compiled a separate model
+with all dimensions fixed to \texttt{maxSeq=512}:
+
+\begin{itemize}
+\item \texttt{attn\_mask} $(1, 1, 1, 512)$: $-10^4$ for masked
+  positions, 0 for valid.  Updated by a single pointer write per
+  token.
+\item \texttt{kv\_write\_mask} $(1, 1, 512, 1)$: 1.0 at the current
+  write position, 0 elsewhere.
+\item KV cache views: pre-built strided \texttt{MLMultiArray} of shape
+  $(1, n_\text{kv}, 512, d_h)$ backed by the same raw pointer---no
+  new objects created during generation.
+\end{itemize}
+
+Result: prefill improved from 83 to 115~tok/s ($+$39\%) as the ANE
+executes the same cached plan every call.  Per-token ANE latency
+dropped from 11.66 to 10.66~ms ($-$9\%).  Decode at short sequences is
+slightly slower (80 vs.\ 85~tok/s) due to the fixed model attending
+over all 512 positions even when most are masked.
+
+\subsection{Stateful KV Cache (CoreML MLState)}
+
+With the fixed-shape model, the remaining bottleneck is DMA: the
+entire KV cache ($\sim$6~MB for 512 positions $\times$ 24 layers
+$\times$ 2 heads $\times$ 64 dims $\times$ fp16) must be transferred
+host$\to$ANE as input and ANE$\to$host as output every token.
+
+CoreML's \texttt{MLState} API (macOS 15+) allows buffers to persist
+on-device across predictions.  We built a third model variant using
+coremltools 9.0's \texttt{StateType} conversion:
+
+\begin{enumerate}
+\item \textbf{PyTorch model.}  Each attention layer registers its K/V
+  caches via \texttt{register\_buffer()}.  The forward pass performs an
+  in-place scatter-write (\texttt{k\_cache[:] = k\_updated}) that
+  coremltools maps to the \texttt{coreml\_update\_state} MIL op.
+\item \textbf{Conversion.}  Each buffer is declared as
+  \texttt{ct.StateType(wrapped\_type=ct.TensorType(\ldots))},
+  instructing CoreML to keep it on-device.
+\item \textbf{Swift host.}  The forward function passes only 5 inputs
+  (x, rope\_cos, rope\_sin, attn\_mask, kv\_write\_mask)---no KV
+  arrays at all.  Prediction uses
+  \texttt{model.prediction(from:using:state)}, and there is no KV
+  extraction or write-back.
+\end{enumerate}
+
+Result: per-token latency dropped from 10.66 to 5.67~ms.  Decode
+throughput reached \textbf{171~tok/s} ($+$2$\times$ over fixed,
+19$\times$ over initial).  Host pack and extract are now
+\textbf{0.00~ms}---the entire hot path is ANE compute.  Only
+$\sim$4~KB of data crosses the bus per token (x, rope, masks) versus
+$\sim$6~MB previously.
+
 \subsection{Hardware Floor Analysis}
 
 The model weights (472~MB, int8) must be loaded from DRAM each token.
@@ -518,7 +600,8 @@ floor} is:
 t_\text{floor} = \frac{472 \text{ MB}}{100 \text{ GB/s}} \approx 4.7 \text{ ms}
 \end{equation}
 
-Our measured 10.89~ms per token breaks down as:
+With stateful KV caching, measured latency is 5.67~ms per token---only
+1.2$\times$ above the DRAM bandwidth floor:
 
 \begin{center}
 \footnotesize
@@ -527,17 +610,18 @@ Our measured 10.89~ms per token breaks down as:
 \textbf{Component} & \textbf{Estimated (ms)} \\
 \midrule
 DRAM weight loading & $\sim$4.7 \\
-ANE compute & $\sim$1--2 \\
-CoreML dispatch overhead & $\sim$1 \\
-Attention (at avg seq$\approx$78) & $\sim$3--4 \\
+ANE compute & $\sim$0.5--1 \\
+CoreML dispatch overhead & $\sim$0.3 \\
+Host pack (x, rope, masks) & $<$0.01 \\
 \midrule
-\textbf{Total} & $\sim$10.7 \\
+\textbf{Total} & $\sim$5.7 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-This aligns with measurements, confirming we are near the hardware
-limit for this model size on this memory system.
+The stateful model eliminates the $\sim$4~ms of KV cache DMA that
+dominated the non-stateful configurations, bringing total latency
+within 20\% of the hardware floor.
 
 
 %% ════════════════════════════════════════════════════════════════════
@@ -576,19 +660,24 @@ Verification against CPU reference passes with zero mismatches.
 \textbf{Engine} & \textbf{Backend} & \textbf{Prefill} & \textbf{Decode} \\
 \midrule
 llama.cpp & Metal GPU & 5,978 t/s & 332 t/s \\
-GOL-ANE & ANE (conv) & 88 t/s & 90 t/s \\
+GOL-ANE (flex) & ANE (conv) & 83 t/s & 85 t/s \\
+GOL-ANE (fixed) & ANE (conv) & 115 t/s & 80 t/s \\
+GOL-ANE (stateful) & ANE (conv) & 170 t/s & 171 t/s \\
 \bottomrule
 \end{tabular}
-\caption{Qwen2.5-0.5B-Instruct (Q8\_0) on Apple M3 Pro. GOL-ANE
-achieves 90~tok/s decode on a compute unit that llama.cpp does not
-use.}
+\caption{Qwen2.5-0.5B-Instruct (Q8\_0) on Apple M4 Max. Stateful mode
+achieves 171~tok/s decode---within 2$\times$ of llama.cpp on Metal
+GPU---on a compute unit that llama.cpp does not use.}
 \label{tab:transformer}
 \end{table}
 
-The GOL-ANE transformer decode throughput is 3.7$\times$ slower than
-llama.cpp on Metal GPU, but operates on an entirely different compute
-unit. The ANE path leaves the GPU free for other tasks (rendering,
-other models).
+The GOL-ANE stateful configuration reaches 171~tok/s decode, within
+2$\times$ of llama.cpp on Metal GPU, while operating on an entirely
+different compute unit. The ANE path leaves the GPU free for other
+tasks (rendering, other models). Fixed-shape mode wins on prefill
+(115~tok/s) due to ANE graph caching but loses on decode due to
+full-width attention; stateful mode dominates both by eliminating KV
+cache DMA entirely.
 
 \subsection{Optimization Impact}
 
@@ -598,18 +687,18 @@ other models).
 \begin{axis}[
   ybar,
   width=\columnwidth,
-  height=4.5cm,
+  height=5cm,
   ylabel={tok/s},
   ylabel style={font=\footnotesize},
-  ymin=0, ymax=100,
+  ymin=0, ymax=190,
   xtick=data,
-  xticklabels={Initial, +Iverson\\layout, +Stepanov\\prealloc, +Dragon\\Book, +Brodie\\boundaries, +Batched\\GQA},
-  xticklabel style={font=\tiny, align=center, rotate=30, anchor=east},
-  bar width=0.5cm,
+  xticklabels={Initial, +Iverson\\layout, +Stepanov\\prealloc, +Dragon\\Book, +Brodie\\bounds, +GQA, +Pre-alloc\\buffers, +Fixed\\shapes, +Stateful\\KV},
+  xticklabel style={font=\tiny, align=center, rotate=35, anchor=east},
+  bar width=0.4cm,
   nodes near coords,
   nodes near coords style={font=\tiny},
   every node near coord/.append style={above},
-  enlarge x limits=0.15,
+  enlarge x limits=0.1,
 ]
 \addplot[fill=convblue!70] coordinates {
   (1, 9)
@@ -618,13 +707,17 @@ other models).
   (4, 62)
   (5, 78)
   (6, 90)
+  (7, 85)
+  (8, 80)
+  (9, 171)
 };
 \end{axis}
 \end{tikzpicture}
-\caption{Cumulative decode throughput improvement from each
-optimization. The four book-driven optimizations eliminate host
-overhead (9$\to$78 tok/s, 8.7$\times$); batched GQA reduces ANE
-scheduling overhead (78$\to$90 tok/s, 1.15$\times$). Total: 10$\times$.}
+\caption{Cumulative decode throughput. Book-driven host elimination:
+9$\to$78~tok/s (8.7$\times$). Batched GQA: 78$\to$90. Pre-allocated
+buffers reduce pack overhead to 0.4\%. Fixed shapes trade decode
+speed for prefill (115~tok/s prefill). Stateful KV eliminates DMA
+entirely: 171~tok/s (19$\times$ total).}
 \label{fig:optbar}
 \end{figure}
 
@@ -678,20 +771,28 @@ Convolution is enough. Conway's Game of Life and a full transformer
 share the same single primitive---convolution---and run on the same
 silicon: the Apple Neural Engine's 16-core conv unit. The GOL encoding
 is exact (not an approximation), and the transformer produces coherent
-text at 90~tok/s.
+text at 171~tok/s---within 2$\times$ of llama.cpp on Metal GPU, on a
+compute unit that conventional LLM engines ignore entirely.
 
-The optimization journey from 9 to 90~tok/s demonstrates that
-classical techniques---memory layout (Iverson), pre-allocation
-(Stepanov), strength reduction (Dragon Book), and data boundary
-elimination (Brodie)---remain directly applicable to novel hardware
-accelerators. The final system operates within $\sim$1~ms of the DRAM
-bandwidth floor for its model size.
+The optimization journey from 9 to 171~tok/s (19$\times$) demonstrates
+two complementary principles:
+\begin{enumerate}
+\item \textbf{Classical techniques transfer.} Memory layout (Iverson),
+  pre-allocation (Stepanov), strength reduction (Dragon Book), and
+  data boundary elimination (Brodie) remain directly applicable to
+  novel hardware accelerators, delivering a 10$\times$ improvement
+  (9$\to$90~tok/s).
+\item \textbf{Eliminate data movement.} The remaining 2$\times$
+  (90$\to$171~tok/s) came entirely from reducing host$\leftrightarrow$ANE
+  data transfer: pre-allocated buffers removed allocation overhead,
+  fixed shapes removed ANE replanning, and CoreML's \texttt{MLState}
+  API eliminated KV cache DMA entirely---reducing per-token bus
+  traffic from $\sim$6~MB to $\sim$4~KB.
+\end{enumerate}
 
-\paragraph{Future directions.} Pre-allocating output
-\texttt{MLMultiArray} buffers to avoid per-call allocation, compiling
-multiple models at different sequence lengths, and exploring the ANE's
-model-chaining API for zero-copy layer pipelining could further close
-the gap to the hardware floor.
+The final system operates within 20\% of the DRAM bandwidth floor
+(5.67~ms measured vs.\ 4.7~ms theoretical), with the host contributing
+effectively zero overhead.
 
 
 %% ════════════════════════════════════════════════════════════════════
@@ -727,7 +828,10 @@ Principles, Techniques, and Tools}, 2nd~ed., Addison-Wesley, 2006.
 
 \bibitem{brodie2004}
 L.~Brodie, \emph{Thinking Forth}, Punchy Publishing, 2004.
-
+\bibitem{apple2024state}
+Apple Inc., ``Making predictions with a stateful model,''
+Apple Developer Documentation, 2024.
+\\url{https://developer.apple.com/documentation/coreml/making-predictions-with-a-stateful-model}
 \end{thebibliography}
 
 \end{document}

@@ -1138,40 +1138,19 @@ bandwidth floor (1.83~ms per token at 546~GB/s) is $\sim$15$\times$
 below actual latency, confirming that the transcendental cost, not
 memory bandwidth, is the bottleneck.
 
-\paragraph{Why not the Apple Neural Engine?}
-The Apple Neural Engine (ANE) is a fixed-function accelerator optimized
-for layer-granularity neural network operations: convolution, matrix
-multiplication, scaled dot-product attention, and a small set of
-activation functions (ReLU, sigmoid, tanh)~\cite{kumaresan2026}.  Our
-reverse-engineering study of the \texttt{ANECompiler.framework} Mach-O
-symbols reveals per-layer validators (\texttt{ConvLayer},
-\texttt{MatrixMultLayer}, \texttt{SDPALayer}, \texttt{NeuronLayer},
-etc.)~but \emph{no} standalone \texttt{exp()} or \texttt{ln()}
-validators.  Element-wise transcendentals appear to exist only as fused
-components of recognized patterns (softmax, layer~norm), not as
-first-class operations.
-
-This creates an architectural mismatch: EML's power lies in expressing
-\emph{all} computation through $\exp/\ln$, but the ANE's power lies in
+\paragraph{The Apple Neural Engine.}
+In a companion paper~\cite{videla2026ane}, we show that the ANE
+\emph{can} run a full transformer at 171~tok/s decode by mapping every
+linear layer to \texttt{Conv2d(1$\times$1)}.  That work uses native
+matrix multiplication (not EML) inside the convolution units.
+The ANE's fixed-function accelerator has no standalone \texttt{exp()} or
+\texttt{ln()} primitives exposed to user code---element-wise
+transcendentals exist only as fused components of recognized patterns
+(softmax, layer~norm).  EML's power lies in expressing \emph{all}
+computation through $\exp/\ln$, but the ANE's power lies in
 \emph{bypassing} transcendentals via fixed-function matrix and
-convolution units.  Two mapping strategies exist:
-\begin{enumerate}
-\item \textbf{Pre-simplify to ANE layers.}  Since
-  $\exp(\ln a + \ln b) = a \cdot b$, we could algebraically simplify
-  the EML graph back to standard matmul/softmax/layernorm before
-  submission as MIL (the ANE compiler's proven input format).  This
-  defeats EML's purpose but would prove the graph is \emph{equivalent}
-  to a standard network.
-\item \textbf{Hybrid split.}  Use the ANE for operations it handles
-  natively (matmul via \texttt{MatrixMultLayer}, attention via
-  \texttt{SDPALayer}) while keeping EML-specific transcendentals on
-  CPU or GPU.  The ANE compiler's subgraph-identification pass
-  already performs this kind of graph splitting automatically.
-\end{enumerate}
-Neither path preserves EML purity on the accelerator.  The honest
-conclusion is that EML is a \emph{mathematical} universality result,
-not a hardware architecture---and today's neural accelerators are
-designed around the exact operations that EML proves redundant.
+convolution units.  Running EML-pure inference on the ANE remains an
+open problem.
 
 \paragraph{Why EML v2 is slightly slower than v1.}
 The sign+magnitude kernel reads two separate arrays (magnitudes + signs)
@@ -1301,6 +1280,12 @@ R.~Kumaresan.
 \newblock Orion: Characterizing and programming Apple's Neural Engine
   for LLM training and inference.
 \newblock \emph{arXiv preprint arXiv:2603.06728}, 2026.
+
+\bibitem{videla2026ane}
+A.~Videla.
+\newblock One Primitive: Running Conway's Game of Life and a
+  Transformer on Apple's Neural Engine via Convolution.
+\newblock Technical report, 2026.
 
 \end{thebibliography}
 
