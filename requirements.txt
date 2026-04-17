@@ -1,0 +1,9 @@
+# Core Python proof-of-concept and verification scripts
+numpy
+
+# GIF and image generation utilities
+Pillow
+
+# CoreML conversion / ANE export scripts
+torch
+coremltools==9.0

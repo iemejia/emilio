@@ -26,6 +26,7 @@ a single algebraic identity suffices for every operation in a production transfo
 | `python/eml_core.py` | Python proof-of-concept with instrumented EML call counts |
 | `python/eml_model.py` | Python model loader (GGUF → EML forward pass) |
 | `python/verify.py` | Correctness verification (Python vs reference) |
+| `requirements.txt` | Python dependencies for verification and model tooling |
 | `compile_model.sh` | Compile GGUF → `.eml` format |
 | `paper.tex` | The paper |
 | `paper.pdf` | Pre-built PDF of the paper |
@@ -41,9 +42,17 @@ a single algebraic identity suffices for every operation in a production transfo
 ### Prerequisites
 
 - Rust ≥ 1.75
-- Python 3.10+ with NumPy (for the Python POC)
+- Python 3.10+ with packages from `requirements.txt`
 - macOS with Apple Silicon (for GPU support)
 - ~1 GB disk for the GGUF model
+
+Install the Python dependencies with:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
 ### Build
 
