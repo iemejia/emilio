@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="en" data-color-mode="dark" data-dark-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Matrix Multiplication via Game of Life on Apple&rsquo;s Neural Engine</title>
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="article">
+  <meta property="og:title" content="Matrix Multiplication via Game of Life on Apple's Neural Engine">
+  <meta property="og:description" content="Conway's Game of Life running on the ANE via Conv2d. A GOL computer computes 2×2 matmul using the power algorithm (Stepanov/Knuth) — ~36M years per token at 91ms/gen on GPU with 8-thread pipelining.">
+  <meta property="og:url" content="https://videlalvaro.github.io/emilio/gol-ane.html">
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Matrix Multiplication via Game of Life on Apple's Neural Engine">
+  <meta name="twitter:description" content="GOL running on the ANE via Conv2d. 91ms/gen, 9600 tiles/s, mmap arena, 8-thread GPU pipelining.">
+
+  <style>
+    :root {
+      --color-canvas-default: #0d1117;
+      --color-canvas-subtle: #161b22;
+      --color-border-default: #30363d;
+      --color-border-muted: #21262d;
+      --color-fg-default: #e6edf3;
+      --color-fg-muted: #7d8590;
+      --color-fg-subtle: #6e7681;
+      --color-accent-fg: #58a6ff;
+      --color-success-fg: #3fb950;
+      --color-attention-fg: #d29922;
+      --color-danger-fg: #f85149;
+      --color-done-fg: #a371f7;
+      --color-canvas-inset: #010409;
+      --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+      --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-canvas-default);
+      color: var(--color-fg-default);
+      line-height: 1.6;
+      font-size: 16px;
+    }
+
+    .container {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 40px 24px 80px;
+    }
+
+    /* ── Header ── */
+    header {
+      border-bottom: 1px solid var(--color-border-default);
+      padding-bottom: 24px;
+      margin-bottom: 32px;
+    }
+
+    header h1 {
+      font-size: 32px;
+      font-weight: 600;
+      line-height: 1.25;
+      margin-bottom: 8px;
+    }
+
+    header .subtitle {
+      color: var(--color-fg-muted);
+      font-size: 16px;
+    }
+
+    header .meta {
+      margin-top: 12px;
+      color: var(--color-fg-subtle);
+      font-size: 14px;
+    }
+
+    header .meta a {
+      color: var(--color-accent-fg);
+      text-decoration: none;
+    }
+
+    header .meta a:hover {
+      text-decoration: underline;
+    }
+
+    /* ── Sections ── */
+    h2 {
+      font-size: 24px;
+      font-weight: 600;
+      margin-top: 40px;
+      margin-bottom: 16px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--color-border-muted);
+    }
+
+    h3 {
+      font-size: 18px;
+      font-weight: 600;
+      margin-top: 28px;
+      margin-bottom: 12px;
+    }
+
+    p {
+      margin-bottom: 16px;
+    }
+
+    /* ── Code ── */
+    code {
+      font-family: var(--font-mono);
+      font-size: 85%;
+      background: var(--color-canvas-subtle);
+      padding: 2px 6px;
+      border-radius: 6px;
+    }
+
+    pre {
+      background: var(--color-canvas-subtle);
+      border: 1px solid var(--color-border-default);
+      border-radius: 6px;
+      padding: 16px;
+      overflow-x: auto;
+      margin-bottom: 16px;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    pre code {
+      background: none;
+      padding: 0;
+      font-size: inherit;
+    }
+
+    /* ── Key figure ── */
+    .key-figure {
+      display: flex;
+      align-items: center;
+      gap: 24px;
+      margin: 24px 0;
+      padding: 20px;
+      border: 1px solid var(--color-border-default);
+      border-radius: 6px;
+      background: var(--color-canvas-subtle);
+    }
+
+    .key-figure .number {
+      font-size: 48px;
+      font-weight: 700;
+      font-family: var(--font-mono);
+      color: var(--color-success-fg);
+      white-space: nowrap;
+    }
+
+    .key-figure .label {
+      color: var(--color-fg-muted);
+      font-size: 15px;
+    }
+
+    /* ── Table ── */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0 24px;
+      font-size: 14px;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 8px 12px;
+      border: 1px solid var(--color-border-default);
+    }
+
+    th {
+      background: var(--color-canvas-subtle);
+      font-weight: 600;
+      color: var(--color-fg-muted);
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+
+    td code {
+      font-size: 12px;
+    }
+
+    /* ── Equation blocks ── */
+    .equation {
+      margin: 20px 0;
+      padding: 16px 20px;
+      background: var(--color-canvas-subtle);
+      border-left: 3px solid var(--color-accent-fg);
+      border-radius: 0 6px 6px 0;
+      font-family: var(--font-mono);
+      font-size: 14px;
+      overflow-x: auto;
+    }
+
+    /* ── Lists ── */
+    ul, ol {
+      margin-bottom: 16px;
+      padding-left: 24px;
+    }
+
+    li {
+      margin-bottom: 6px;
+    }
+
+    /* ── Emphasis ── */
+    strong {
+      font-weight: 600;
+    }
+
+    em {
+      font-style: italic;
+    }
+
+    .highlight {
+      color: var(--color-attention-fg);
+    }
+
+    .success {
+      color: var(--color-success-fg);
+    }
+
+    /* ── Aside / Note ── */
+    .note {
+      margin: 20px 0;
+      padding: 12px 16px;
+      border: 1px solid var(--color-border-default);
+      border-left: 3px solid var(--color-accent-fg);
+      border-radius: 0 6px 6px 0;
+      background: var(--color-canvas-subtle);
+      font-size: 14px;
+      color: var(--color-fg-muted);
+    }
+
+    .note strong {
+      color: var(--color-fg-default);
+    }
+
+    /* ── Diagram blocks ── */
+    .diagram {
+      margin: 24px 0;
+      padding: 20px 24px;
+      background: var(--color-canvas-inset);
+      border: 1px solid var(--color-border-default);
+      border-radius: 6px;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1.6;
+      overflow-x: auto;
+      white-space: pre;
+      color: var(--color-fg-muted);
+    }
+
+    .diagram .hl { color: var(--color-accent-fg); }
+    .diagram .gr { color: var(--color-success-fg); }
+    .diagram .yl { color: var(--color-attention-fg); }
+    .diagram .rd { color: var(--color-danger-fg); }
+    .diagram .pp { color: var(--color-done-fg); }
+
+    /* ── Layered chain ── */
+    .chain {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      margin: 24px 0;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    .chain-box {
+      padding: 12px 16px;
+      border: 1px solid var(--color-border-default);
+      border-radius: 6px;
+      text-align: center;
+      font-size: 13px;
+      background: var(--color-canvas-subtle);
+      min-width: 110px;
+    }
+
+    .chain-box .chain-label {
+      font-size: 11px;
+      color: var(--color-fg-subtle);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 4px;
+    }
+
+    .chain-box .chain-value {
+      font-weight: 600;
+      font-family: var(--font-mono);
+      font-size: 14px;
+    }
+
+    .chain-arrow {
+      font-size: 20px;
+      color: var(--color-fg-subtle);
+      padding: 0 6px;
+    }
+
+    .chain-box.accent { border-color: var(--color-accent-fg); }
+    .chain-box.success { border-color: var(--color-success-fg); }
+    .chain-box.attention { border-color: var(--color-attention-fg); }
+    .chain-box.done { border-color: var(--color-done-fg); }
+
+    /* ── Footer ── */
+    footer {
+      margin-top: 48px;
+      padding-top: 24px;
+      border-top: 1px solid var(--color-border-default);
+      color: var(--color-fg-subtle);
+      font-size: 13px;
+    }
+
+    footer a {
+      color: var(--color-accent-fg);
+      text-decoration: none;
+    }
+
+    footer a:hover {
+      text-decoration: underline;
+    }
+
+    /* ── Responsive ── */
+    @media (max-width: 600px) {
+      .key-figure {
+        flex-direction: column;
+        text-align: center;
+      }
+      header h1 { font-size: 24px; }
+      .chain { flex-direction: column; }
+      .chain-arrow { transform: rotate(90deg); }
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <h1>Matrix Multiplication via Game&nbsp;of&nbsp;Life on Apple&rsquo;s Neural&nbsp;Engine</h1>
+  <p class="subtitle">
+    Conway&rsquo;s Game of Life simulated on the ANE via <code>Conv2d(3&times;3)</code>. A GOL computer computes 2&times;2 matmul using the power algorithm (Stepanov/Knuth)&mdash;<strong>~36M&nbsp;years per token</strong> at 91&nbsp;ms/gen with 8-thread GPU pipelining.
+  </p>
+  <p class="meta">Alvaro Videla &middot; April 2026 &middot; <a href="https://github.com/videlalvaro/emilio">Source code</a></p>
+</header>
+
+<!-- ════════════ Key result ════════════ -->
+
+<div class="key-figure">
+  <span class="number">91&nbsp;ms/gen</span>
+  <span class="label">
+    880 tiles of 1024&times;1024 cells each, processed via <code>Conv2d(3&times;3)</code> on Apple&nbsp;M4&nbsp;Max GPU.
+    <br>9,600&nbsp;tiles/s &mdash; 3.3&times; faster than the initial dual-engine approach, 16&times; faster than the Python baseline.
+  </span>
+</div>
+
+<!-- ════════════ The Chain ════════════ -->
+
+<h2>The Chain</h2>
+
+<p>
+  This project computes matrix multiplication through the most indirect path imaginable.
+  Instead of calling a BLAS library or writing a GPU kernel, we build a <em>computer inside Conway&rsquo;s Game of Life</em>,
+  program it with a matmul routine, then simulate the cellular automaton using a neural-network accelerator
+  that thinks it&rsquo;s running a convolution.
+</p>
+
+<div class="chain">
+  <div class="chain-box accent">
+    <div class="chain-label">Hardware</div>
+    <div class="chain-value">GPU / ANE</div>
+  </div>
+  <span class="chain-arrow">&rarr;</span>
+  <div class="chain-box done">
+    <div class="chain-label">CoreML</div>
+    <div class="chain-value">Conv2d(3&times;3)</div>
+  </div>
+  <span class="chain-arrow">&rarr;</span>
+  <div class="chain-box attention">
+    <div class="chain-label">GOL Rules</div>
+    <div class="chain-value">B3/S23</div>
+  </div>
+  <span class="chain-arrow">&rarr;</span>
+  <div class="chain-box success">
+    <div class="chain-label">GOL Computer</div>
+    <div class="chain-value">8-bit CPU</div>
+  </div>
+  <span class="chain-arrow">&rarr;</span>
+  <div class="chain-box">
+    <div class="chain-label">Program</div>
+    <div class="chain-value">Matmul</div>
+  </div>
+</div>
+
+<p>
+  Every link in this chain is mathematically exact. The Conv2d computes the B3/S23 neighbor sum.
+  The GOL rules produce glider-stream collisions that implement logic gates.
+  The logic gates compose into an ALU.
+  The ALU executes a program that computes <strong>[[1,2],[3,4]] &times; [[5,6],[7,8]] = [[19,22],[43,50]]</strong>.
+</p>
+
+<figure class="gif-container">
+  <img src="emilio/gol-ane-inference/gifs/chain_animation.gif" alt="Animated computation chain: GPU → Conv2d → B3/S23 → GOL Computer → Matmul">
+  <figcaption>The computation chain. Each step is independently verified. The GPU runs a convolution, the convolution implements GOL rules, the rules animate a computer, the computer executes a matmul program.</figcaption>
+</figure>
+
+<!-- ════════════ GOL as Convolution ════════════ -->
+
+<h2>Game of Life as a Convolution</h2>
+
+<p>
+  Conway&rsquo;s Game of Life applies two rules to every cell each generation:
+  a dead cell with exactly 3 live neighbors is <em>born</em>, and a live cell with 2 or 3 live neighbors <em>survives</em>.
+  The first step&mdash;counting neighbors&mdash;is literally a convolution.
+</p>
+
+<h3>The Kernel</h3>
+
+<p>
+  We use a 3&times;3 convolution kernel that counts neighbors while encoding the current cell state:
+</p>
+
+<div class="diagram"><span class="hl">kernel = [[1, 1, 1],</span>
+<span class="hl">          [1, 9, 1],</span>
+<span class="hl">          [1, 1, 1]]</span>
+
+For a cell with value <span class="gr">v</span> (0 or 1) and <span class="yl">n</span> neighbors:
+  <span class="gr">s</span> = 9&middot;<span class="gr">v</span> + <span class="yl">n</span>
+
+Dead cell (v=0):  s &isin; {0..8}   &rarr; <span class="gr">birth</span> when s = 3
+Live cell (v=1):  s &isin; {9..17}  &rarr; <span class="gr">survive</span> when s &isin; {11, 12}</div>
+
+<p>
+  The weight of 9 in the center separates the dead/alive cases into non-overlapping integer ranges. A dead cell with 3 neighbors gives <em>s</em>=3 (birth). A live cell with 2 or 3 neighbors gives <em>s</em>=11 or <em>s</em>=12 (survival).
+</p>
+
+<h3>The Decision Logic (13 ops)</h3>
+
+<p>
+  After the convolution, we need to test <em>s</em>=3 (birth) and <em>s</em>&isin;{11,12} (survival).
+  The key optimization: since 11 and 12 are adjacent, we merge them into a single ReLU check:
+</p>
+
+<div class="equation">
+birth = relu(1 &minus; relu(s &minus; 3) &minus; relu(3 &minus; s))
+survive = relu(1.5 &minus; relu(s &minus; 11.5) &minus; relu(11.5 &minus; s))
+output = clamp(birth + survive, 0, 1)
+</div>
+
+<p>
+  The <code>survive</code> formula works because <code>relu(1.5 &minus; |s &minus; 11.5|)</code> returns 1.0 for both <em>s</em>=11 and <em>s</em>=12, and 0.0 for all other integers. This merges two equality checks into one, reducing the total model from 22&nbsp;ops (na&iuml;ve) to <strong>13&nbsp;ops</strong>.
+</p>
+
+<p>
+  The entire model&mdash;one convolution, six ReLUs, four subtractions, one addition, one clamp&mdash;compiles to a single CoreML <code>.mlmodelc</code> that runs on the GPU or ANE.
+</p>
+
+<figure class="gif-container">
+  <img src="emilio/gol-ane-inference/gifs/kernel_math.gif" alt="Step-by-step Conv2d kernel math showing birth, survival, and death">
+  <figcaption>The Conv2d kernel in action. Three scenarios: birth (dead cell, 3 neighbors, s=3), survival (alive cell, 2 neighbors, s=11), and death by overcrowding (alive cell, 4 neighbors, s=13). The ReLU chain decides the outcome.</figcaption>
+</figure>
+
+<figure class="gif-container">
+  <img src="emilio/gol-ane-inference/gifs/gol_conv_step.gif" alt="Gosper glider gun evolving generation by generation via Conv2d">
+  <figcaption>A Gosper glider gun evolving via Conv2d(3&times;3). The blue box shows the 3&times;3 kernel window scanning across alive cells, computing neighbor sums and applying birth/survival rules. Population grows as gliders stream southeast.</figcaption>
+</figure>
+
+<!-- ════════════ The GOL Computer ════════════ -->
+
+<h2>The GOL Computer</h2>
+
+<p>
+  Inside the GOL grid sits a fully functional 8-bit computer built entirely from
+  standard Game of Life structures: <strong>Gosper glider guns</strong> (period-30 signal sources),
+  <strong>eater patterns</strong> (signal sinks), and <strong>glider-stream collisions</strong> (logic gates).
+</p>
+
+<h3>Architecture</h3>
+
+<div class="diagram"><span class="pp">GOL Computer (8-bit, 8 registers, 32-instruction ROM)</span>
+<span class="hl">━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
+  Registers:  a0&ndash;a7 (8-bit each)
+  ROM:        32 instructions &times; 22 bits
+  ALU:        add, subtract, bitwise ops, shifts
+  I/O:        print instruction outputs register value
+
+<span class="yl">Instruction format (22 bits):</span>
+  [opcode:5] [aw:3] [ar1:3] [ar2:3] [data:8]
+
+<span class="gr">Gate implementation:</span>
+  Each logic gate = glider streams colliding
+  AND = two gliders must arrive to produce output
+  NOT = gun + eater (input kills the gun&rsquo;s glider)
+  OR  = two independent paths merge
+  XOR = constructed from AND, OR, NOT
+
+<span class="hl">Scale:</span>
+  1,342,255 base cells (unprogrammed)
+  +  84,743 ROM cells (matmul program)
+  = <span class="gr">1,426,998</span> total alive cells
+  Bounding box: ~210,000 &times; 215,000 cells</div>
+
+<p>
+  The computer is a published, verified GOL pattern. Each instruction cycle takes
+  approximately 41.9 million GOL generations&mdash;the time for glider signals to propagate through the
+  logic circuitry, execute one ALU operation, and write back to registers.
+</p>
+
+<h3>The Matmul Program</h3>
+
+<p>
+  The computer has no multiply instruction. The na&iuml;ve approach is repeated addition (O(<em>b</em>)
+  iterations to compute <em>a</em>&times;<em>b</em>). But we can do better: Stepanov&rsquo;s <em>power algorithm</em>
+  on the monoid (&Zopf;,&thinsp;+,&thinsp;0) gives us multiplication in O(log&thinsp;<em>b</em>) via
+  binary decomposition of the multiplier&mdash;the
+  <a href="https://alvaro-videla.com/2014/03/the-power-algorithm.html" style="color:var(--color-accent-fg);text-decoration:none">Russian peasant method</a>,
+  derived from Knuth&rsquo;s TAOCP&nbsp;&sect;4.6.3 and Stepanov&nbsp;&amp;&nbsp;McJones&rsquo;
+  <em>Elements of Programming</em>.
+</p>
+
+<p>
+  The key insight: any associative binary operation with an identity element defines a monoid.
+  Addition on integers is such an operation (identity: 0). The repeated-squaring algorithm
+  that computes <em>x<sup>n</sup></em> in O(log&thinsp;<em>n</em>) multiplications works identically
+  for multiplication-via-addition: double the multiplicand and halve the multiplier, accumulating
+  when the current bit is set. For C[0][0] = 1&times;5 + 2&times;7:
+</p>
+
+<pre><code>; ── Power algorithm: multiply via binary decomposition ──
+; multiply(a, b) = power(a, b, 0, +)
+; Instead of adding a to itself b times, scan b's bits:
+;   if LSB(b) = 1: accumulator += x
+;   x += x (double)
+;   b >>= 1 (halve)
+;
+write a3 0        ; accumulator = 0
+write a4 1        ; constant 1
+write a6 1        ; x = A[0][0] = 1
+write a1 5        ; n = B[0][0] = 5 (binary: 101)
+and a2 a1 a4      ; test LSB of n     ◄── power loop
+!=0 a5 a2         ; is it set?
+jump a5           ; if set, skip &rarr;
+goto 9            ;   &rarr; (skip accumulate)
++ a3 a3 a6        ; acc += x          ◄── accumulate
++ a6 a6 a6        ; x += x (double)
+&gt;&gt; a1 a1          ; n &gt;&gt;= 1 (halve)
+!=0 a5 a1         ; n still nonzero?
+jump a5           ; if so, loop &rarr;
+goto 15           ;   &rarr; next multiply
+goto 4            ;   &rarr; back to loop
+write a6 2        ; x = A[0][1] = 2
+write a1 7        ; n = B[1][0] = 7 (binary: 111)
+                  ; ... (same loop structure)
+print a3          ; output: 19
+goto 29           ; halt</code></pre>
+
+<p>
+  For <code>1&times;5</code>: 5 = 101<sub>2</sub> &rarr; 3 iterations (test, double, test, accumulate+double, test, accumulate).
+  For <code>2&times;7</code>: 7 = 111<sub>2</sub> &rarr; 3 iterations.
+  Compare with the na&iuml;ve approach: 5 additions then 7 additions = 12 loop iterations.
+</p>
+
+<table>
+  <thead>
+    <tr><th>Algorithm</th><th>Instructions</th><th>Cycles</th><th>GOL Generations</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Na&iuml;ve (repeated addition)</td>
+      <td>20</td>
+      <td>67</td>
+      <td>2.81 &times; 10<sup>9</sup></td>
+    </tr>
+    <tr>
+      <td class="success"><strong>Power algorithm (binary decomposition)</strong></td>
+      <td>30</td>
+      <td class="success"><strong>61</strong></td>
+      <td class="success"><strong>2.56 &times; 10<sup>9</sup></strong></td>
+    </tr>
+    <tr>
+      <td colspan="2">Savings</td>
+      <td>6 cycles (9%)</td>
+      <td>251 million</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="note">
+  <strong>Why only 9% here?</strong> The multipliers (5 and 7) are small&mdash;only 3 bits each.
+  The power algorithm&rsquo;s per-iteration overhead (and, !=0, jump, goto) is similar to the na&iuml;ve loop (-, !=0, jump, goto).
+  For an 8-bit multiplier like 200, the savings would be dramatic: O(200) &rarr; O(8) iterations.
+  The deeper lesson: <em>abstract algebra applied to a GOL computer saves hundreds of millions of generations.</em>
+</div>
+
+<!-- ════════════ Tiled Simulation ════════════ -->
+
+<h2>Tiling the Universe</h2>
+
+<p>
+  The GOL computer spans ~210,000&times;215,000 cells&mdash;far too large for a single CoreML prediction.
+  We tile it into <strong>1024&times;1024 chunks</strong> with 1-cell overlap borders for neighbor exchange:
+</p>
+
+<div class="diagram"><span class="yl">Tile layout (1026&times;1026 padded):</span>
+
+  <span class="rd">┌─────────────────────────┐</span>
+  <span class="rd">│</span> <span class="hl">border (1 cell)</span>           <span class="rd">│</span>
+  <span class="rd">│</span>  <span class="gr">┌───────────────────┐</span>  <span class="rd">│</span>
+  <span class="rd">│</span>  <span class="gr">│</span>                   <span class="gr">│</span>  <span class="rd">│</span>
+  <span class="rd">│</span>  <span class="gr">│</span>  1024 &times; 1024 tile <span class="gr">│</span>  <span class="rd">│</span>
+  <span class="rd">│</span>  <span class="gr">│</span>  (interior cells)  <span class="gr">│</span>  <span class="rd">│</span>
+  <span class="rd">│</span>  <span class="gr">│</span>                   <span class="gr">│</span>  <span class="rd">│</span>
+  <span class="rd">│</span>  <span class="gr">└───────────────────┘</span>  <span class="rd">│</span>
+  <span class="rd">│</span>           <span class="hl">border</span>          <span class="rd">│</span>
+  <span class="rd">└─────────────────────────┘</span>
+
+  Input to CoreML:  [1, 1, <span class="yl">1026</span>, <span class="yl">1026</span>] Float16
+  Output from CoreML: [1, 1, 1026, 1026] Float16
+  Keep inner 1024&times;1024 &rarr; next generation
+
+<span class="pp">Grid statistics:</span>
+  Total alive cells:  1,426,998
+  Non-empty tiles:    <span class="gr">880</span> (out of ~210&times;210 = 44,100 possible)
+  Sparsity:           98% of tiles are empty (skipped)</div>
+
+<p>
+  Each generation, we identify the 880 non-empty tiles plus their neighbors (which might birth new cells),
+  copy border cells from adjacent tiles, feed each padded 1026&times;1026 array through the Conv2d model,
+  and extract the inner 1024&times;1024 result.
+</p>
+
+<figure class="gif-container">
+  <img src="emilio/gol-ane-inference/gifs/tiled_computer.gif" alt="880 tiles of the GOL computer being processed by 8 GPU workers">
+  <figcaption>The GOL computer&rsquo;s ~970 tiles being processed. Blue tiles are actively being fed to the GPU; green tiles are queued. 98% of the 44,100 possible tile positions are empty and skipped entirely.</figcaption>
+</figure>
+
+<!-- ════════════ Performance Journey ════════════ -->
+
+<h2>Performance Journey: 15s &rarr; 91ms per Generation</h2>
+
+<p>
+  The optimization path took us through seven major milestones, delivering a <strong>165&times;</strong> total speedup:
+</p>
+
+<table>
+  <thead>
+    <tr><th>#</th><th>Optimization</th><th>ms/gen</th><th>Speedup</th><th>Cumulative</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>0</td>
+      <td>Python baseline (coremltools, single ANE)</td>
+      <td class="highlight">15,000</td>
+      <td>&mdash;</td>
+      <td>1&times;</td>
+    </tr>
+    <tr>
+      <td>1</td>
+      <td>Optimal tile size (1024&times;1024)</td>
+      <td>1,000</td>
+      <td>15&times;</td>
+      <td>15&times;</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>Swift port + Float16 native + output backing</td>
+      <td>550</td>
+      <td>1.8&times;</td>
+      <td>27&times;</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>Dual-engine dispatch (ANE + GPU parallel)</td>
+      <td>300</td>
+      <td>1.8&times;</td>
+      <td>50&times;</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>Precompiled padded tiles + zero-copy borders</td>
+      <td>290</td>
+      <td>1.03&times;</td>
+      <td>52&times;</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td>GPU-only + 4-thread pipeline</td>
+      <td>170</td>
+      <td>1.7&times;</td>
+      <td>88&times;</td>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td>8-thread GPU pipeline + inline pop counting</td>
+      <td class="success"><strong>91</strong></td>
+      <td class="success"><strong>1.9&times;</strong></td>
+      <td class="success"><strong>165&times;</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>1. Tile Size Optimization (15s &rarr; 1s)</h3>
+
+<p>
+  CoreML has fixed dispatch overhead per prediction call (~0.25ms). With small tiles (e.g. 128&times;128),
+  the overhead dominates. At 1024&times;1024, each tile has enough computation to amortize dispatch cost,
+  and the 880 non-empty tiles keep memory manageable at ~1.8&nbsp;GB.
+</p>
+
+<h3>2. Swift + Float16 + Output Backing (1s &rarr; 550ms)</h3>
+
+<p>
+  Three wins from rewriting in Swift:
+</p>
+<ul>
+  <li><strong>Float16 native:</strong> Tiles stored as <code>UInt16</code> (Float16 bit patterns). No Float32 conversion. Alive check: <code>v &ge; 0x3800</code> (0.5 in Float16).</li>
+  <li><strong>Reusable feature provider:</strong> A single <code>GridFeatureProvider</code> object reused across all tiles, avoiding per-tile dictionary allocation.</li>
+  <li><strong>Output backing:</strong> <code>opts.outputBackings = ["next_grid": outArr]</code> pre-allocates the output MLMultiArray, giving contiguous strides and eliminating per-prediction allocation.</li>
+</ul>
+
+<h3>3. Dual-Engine Dispatch (550ms &rarr; 300ms)</h3>
+
+<p>
+  Load the CoreML model twice&mdash;once with <code>.cpuAndGPU</code>, once with <code>.cpuAndNeuralEngine</code>.
+  Split tiles 67/33 GPU/ANE (GPU is 2&times; faster per tile at 0.30ms vs 0.61ms) and dispatch in parallel via GCD.
+  Both engines run simultaneously.
+</p>
+
+<h3>4. Precompiled Padded Tiles (550ms &rarr; 290ms)</h3>
+
+<p>
+  Store tiles in padded 1026&times;1026 format permanently. Border updates become 32&nbsp;KB edge copies
+  instead of full 4.1&nbsp;MB <code>memset</code> + <code>memcpy</code> per tile. Border time dropped from ~100ms to <strong>9ms</strong>.
+</p>
+
+<h3>5&ndash;6. The Pipelining Breakthrough (290ms &rarr; 91ms)</h3>
+
+<p>
+  A microbenchmark revealed the key insight: <strong>CoreML pipelines concurrent predictions on the GPU.</strong>
+  Feeding the same model from multiple threads doesn&rsquo;t serialize&mdash;the GPU interleaves kernel dispatches:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Threads</th><th>Effective ms/tile</th><th>880 tiles (ms)</th><th>Throughput</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>0.273</td><td>240</td><td>3,660 tiles/s</td></tr>
+    <tr><td>2</td><td>0.144</td><td>127</td><td>6,950 tiles/s</td></tr>
+    <tr><td>4</td><td>0.079</td><td>70</td><td>12,620 tiles/s</td></tr>
+    <tr><td>8</td><td>0.071</td><td>62</td><td>14,100 tiles/s</td></tr>
+  </tbody>
+</table>
+
+<p>
+  Crucially, <strong>the ANE does not benefit from pipelining</strong>&mdash;it saturates at 2 threads (2,000 tiles/s
+  regardless of thread count). And adding ANE threads to GPU threads <em>hurts</em> throughput by stealing
+  CPU dispatch time. The optimal strategy: <strong>GPU-only, 8 feeder threads, no ANE.</strong>
+</p>
+
+<figure class="gif-container">
+  <img src="emilio/gol-ane-inference/gifs/pipeline_scaling.gif" alt="Bar chart showing throughput scaling from Python baseline to 8-thread GPU">
+  <figcaption>Throughput scaling across optimization milestones. The GPU pipelines concurrent predictions &mdash; scaling nearly linearly from 1 to 8 feeder threads. The ANE saturates at 2 threads.</figcaption>
+</figure>
+
+<div class="note">
+  <strong>Why GPU beat ANE here:</strong> The GOL model is a single 3&times;3 convolution followed by 12 element-wise ops.
+  The ANE excels at deep networks with many sequential convolutions (its pipeline stays full).
+  For a single shallow conv, the GPU&rsquo;s lower dispatch latency wins.
+</div>
+
+<p>
+  The final optimization: <strong>inline population counting.</strong> Instead of scanning all 880 tiles after prediction
+  (which took 256ms single-threaded!), we count alive cells immediately after the output <code>memcpy</code> while
+  the data is hot in L1 cache. Cost: effectively zero&mdash;hidden behind the GPU prediction latency.
+</p>
+
+<!-- ════════════ Architecture ════════════ -->
+
+<h2>Final Architecture</h2>
+
+<div class="diagram"><span class="pp">Per-generation pipeline (91ms total):</span>
+
+  <span class="hl">Phase 1: Border Update</span> (9ms, main thread)
+  ┌──────────────────────────────────────────────┐
+  │ For each of 880 tiles:                       │
+  │   Copy 4 edges + 4 corners from neighbors    │
+  │   (~32 KB per tile, edge cells only)         │
+  └──────────────────────────────────────────────┘
+                       │
+                       ▼
+  <span class="gr">Phase 2: Pipelined GPU Prediction</span> (82ms, 8 threads)
+  ┌──────────────────────────────────────────────┐
+  │ Thread 0: tile 0,8,16...  ──┐               │
+  │ Thread 1: tile 1,9,17...  ──┤               │
+  │ Thread 2: tile 2,10,18... ──┤  GPU pipelines │
+  │ Thread 3: tile 3,11,19... ──┤  all 8 streams │
+  │ Thread 4: tile 4,12,20... ──┤  concurrently  │
+  │ Thread 5: tile 5,13,21... ──┤               │
+  │ Thread 6: tile 6,14,22... ──┤               │
+  │ Thread 7: tile 7,15,23... ──┘               │
+  │                                              │
+  │ Per tile: memcpy in &rarr; predict &rarr; memcpy out │
+  │           + <span class="yl">inline pop count</span> (L1-hot)       │
+  └──────────────────────────────────────────────┘
+
+<span class="hl">Memory layout:</span>
+  Two <span class="pp">mmap(MAP_ANON)</span> arenas, double-buffered
+  Each arena: 1200 &times; 1026&sup2; &times; 2 bytes = ~2.5 GB
+  Arena swap each generation (pointer flip, no copy)
+
+<span class="hl">Per-worker resources</span> (pre-allocated, reused):
+  &bull; 1 input  MLMultiArray [1,1,1026,1026] Float16
+  &bull; 1 output MLMultiArray [1,1,1026,1026] Float16  (output backing)
+  &bull; 1 GridFeatureProvider (wraps input array)
+  &bull; 1 MLPredictionOptions (with output backing set)</div>
+
+<!-- ════════════ Matmul in Generations ════════════ -->
+
+<h2>What a Matmul Costs in GOL Generations</h2>
+
+<p>
+  Qwen 2.5-0.5B performs 169 matrix multiplications per token. Each matmul is a matrix&ndash;vector product
+  <em>y</em>&nbsp;=&nbsp;<em>Wx</em> where <em>W</em> has up to 151,936&times;896 entries. Every entry requires one
+  multiply-accumulate, and each multiply on the GOL computer costs ~41.9&nbsp;million generations
+  (one instruction cycle).
+</p>
+
+<div class="diagram"><span class="pp">One token through Qwen 2.5-0.5B via GOL (power algorithm):</span>
+
+  169 matmuls/token
+  &times; avg ~1.97M multiply-accumulate ops/matmul
+  = <span class="yl">~333M</span> dot products per token
+
+  Each dot product = 1 multiply + 1 accumulate
+  Each multiply &asymp; <span class="hl">41.9M</span> GOL generations (one instruction cycle)
+  Power algorithm: <span class="hl">61 cycles</span> per dot product (vs 67 na&iuml;ve) = 91% of cost
+
+  Total: 333M &times; 41.9M &times; 61/67 = <span class="rd">1.270 &times; 10&sup1;&sup6;</span> generations per token
+
+  At <span class="gr">91ms/gen</span>:
+  1.270 &times; 10&sup1;&sup6; &times; 0.091s = 1.16 &times; 10&sup1;&sup5; seconds
+                            = <span class="gr">~36 million years per token</span></div>
+
+<div class="key-figure">
+  <span class="number">36M&nbsp;years</span>
+  <span class="label">
+    Per token of Qwen&nbsp;2.5&#8209;0.5B, if every matmul were computed by a Game&nbsp;of&nbsp;Life cellular automaton
+    running on the Apple&nbsp;M4&nbsp;Max GPU via CoreML <code>Conv2d(3&times;3)</code>.
+    <br>Down from 247M&nbsp;years before pipelining. The power algorithm (Stepanov/Knuth) saves another 4M&nbsp;years over na&iuml;ve multiply.
+    <br>Total shaved: <em>211&nbsp;million years</em>.
+  </span>
+</div>
+
+<p>
+  For cosmic perspective: light traveling for 36 million years is well on its way to the <strong>Virgo Cluster</strong>&mdash;far
+  beyond our galaxy. Before optimization, it would have reached the Sculptor Supercluster.
+</p>
+
+<!-- ════════════ The Proof ════════════ -->
+
+<h2>Chain of Proof</h2>
+
+<p>
+  Every link in the computation chain is independently verified:
+</p>
+
+<ol>
+  <li><strong>ISA emulator</strong> confirms the matmul program produces [19, 22, 43, 50] for A&times;B (power algorithm: 61 cycles, na&iuml;ve: 67 cycles)</li>
+  <li><strong>Hashlife vs na&iuml;ve simulator</strong> agree on Gosper gun populations after 128 generations (B3/S23 rules correct)</li>
+  <li><strong>Assembly &rarr; binary</strong> produces 30 instructions &times; 22 bits (power algorithm), placed correctly in ROM coordinates</li>
+  <li><strong>GOL computer simulation</strong> (via Hashlife) shows population divergence from blank computer, confirming active computation</li>
+  <li><strong>Tiled ANE/GPU simulation</strong> produces correct populations generation-over-generation: 1,447,249 &rarr; 1,437,644 &rarr; 1,437,588 &rarr; 1,412,604 &rarr; 1,426,257</li>
+  <li><strong>CoreML Conv2d model</strong> verified against PyTorch GOL step on blinker, glider, and random grids</li>
+</ol>
+
+<div class="note">
+  <strong>No cheating.</strong> The GOL grid is the compute substrate. The Conv2d kernel implements the standard B3/S23 neighbor count.
+  The decision logic uses only ReLU and clamp&mdash;operations any neural network accelerator supports natively.
+  No special-case code recognizes &ldquo;this is a GOL computer&rdquo; and shortcuts the computation.
+</div>
+
+<!-- ════════════ Algebraic Insights ════════════ -->
+
+<h2>What the Books Say</h2>
+
+<p>
+  The power algorithm is one of several insights from rereading classic CS texts
+  with fresh eyes. Nine books were surveyed for ideas applicable to this project.
+  Here are the ones that yield concrete improvements or deeper understanding.
+</p>
+
+<h3>Stepanov &amp; McJones: <em>Elements of Programming</em></h3>
+
+<p><strong>1. Power algorithm on monoids</strong> (applied above).<br>
+  Addition on integers forms a monoid: it&rsquo;s associative and has identity 0.
+  Stepanov&rsquo;s key theorem: for any semigroup, the power algorithm computes
+  <em>x</em>&middot;<em>n</em> in &Theta;(log&thinsp;<em>n</em>) operations instead of &Theta;(<em>n</em>).
+  Applied here: multiply without a multiply instruction.
+</p>
+
+<p><strong>2. Orbit detection for halt detection.</strong><br>
+  The GOL step is a <em>transformation</em> on the set of all grid states.
+  Stepanov&rsquo;s Chapter&nbsp;2 defines the <em>orbit</em> of a transformation:
+  the sequence <em>x</em>, <em>f</em>(<em>x</em>), <em>f</em>(<em>f</em>(<em>x</em>)), &hellip; which either converges to a cycle
+  or a fixed point. The GOL computer enters a periodic orbit once the program halts
+  (the halt loop <code>goto 29</code> produces a repeating population signature).
+  Floyd&rsquo;s or Brent&rsquo;s cycle-detection algorithm could detect this
+  from the population time series alone&mdash;halting the simulation early without needing
+  to decode register values from the GOL grid. This would save millions of unnecessary
+  GOL generations after the computation completes.
+</p>
+
+<h3>Iverson: <em>A Programming Language</em> (APL)</h3>
+
+<p><strong>Spatial parallelism via outer product.</strong><br>
+  APL&rsquo;s outer product <code>A&nbsp;&compfn;.&times;&nbsp;B</code> computes all products simultaneously.
+  The GOL grid is a 2D spatial computation medium&mdash;it supports <em>spatial parallelism for free</em>.
+  Instead of computing C[0][0], C[0][1], C[1][0], C[1][1] sequentially (4 program runs),
+  place <strong>four independent GOL computers</strong> in different regions of the grid, each programmed with
+  one dot product. They all evolve in the same GOL step. This turns 4&times;<em>T</em> generations
+  into <em>T</em> generations&mdash;a 4&times; speedup for free.
+  For general <em>m</em>&times;<em>n</em> matmul, the parallelism is <em>m</em>&middot;<em>n</em>&times;.
+  Iverson&rsquo;s insight: &ldquo;think of the whole array operation as a single entity, not a loop over scalars.&rdquo;
+</p>
+
+<h3>Knuth: <em>TAOCP</em> Vol.&nbsp;2, &sect;4.6.3</h3>
+
+<p><strong>Addition chains for compile-time constants.</strong><br>
+  The power algorithm is optimal for arbitrary multipliers. But when the multiplier is a
+  <em>compile-time constant</em> (as it is here: 5 and 7 are fixed), Knuth shows we can do even better
+  via <em>addition chains</em>&mdash;the shortest sequence of doublings and additions to reach a target.
+  For example: <code>1&times;5</code> can be computed as <code>(1&lt;&lt;2)+1</code> = 2 ops (shift+add),
+  and <code>2&times;7</code> as <code>(2&lt;&lt;2)+(2&lt;&lt;1)+2</code> or <code>(2&lt;&lt;3)&minus;2</code> = 2&ndash;3 ops.
+  Finding the <em>shortest</em> addition chain is NP-hard in general, but for small constants
+  it&rsquo;s trivially solvable.
+</p>
+
+<h3>Brodie: <em>Thinking Forth</em></h3>
+
+<p><strong>&ldquo;Don&rsquo;t solve problems. Eliminate them.&rdquo;</strong><br>
+  Brodie&rsquo;s deepest insight: if the values are known at compile time, don&rsquo;t multiply at all.
+  For our specific case, <code>1&times;5 = 5</code> (identity) and <code>2&times;7 = 7+7</code> (one addition).
+  So C[0][0] = 5 + 14 = 19 takes <strong>2 additions total, no loops</strong>.
+  This is the Forth philosophy of <em>factoring</em> applied to program generation:
+  the assembler (which runs at &ldquo;compile time&rdquo; in the real world) should constant-fold
+  and strength-reduce before emitting GOL ROM instructions.
+  Fewer instructions = fewer GOL generations = fewer universe-years of computation.
+</p>
+
+<h3>Dragon Book: Common Subexpression Elimination</h3>
+
+<p><strong>Shared multiplicands across dot products.</strong><br>
+  In the full 2&times;2 matmul, <code>B[0][0]=5</code> appears in both C[0][0] and C[1][0].
+  The na&iuml;ve approach computes <code>a&times;5</code> twice. CSE from the Dragon Book (&sect;9.5) says:
+  compute the multiplication once, store the result, reuse it. With the GOL computer&rsquo;s
+  <code>rfb</code>/<code>wfb</code> (register file read/write), partial products can be cached in unused registers.
+  This is especially powerful combined with the Iverson spatial-parallelism insight:
+  if four computers share a memory bus (via glider signals), they could exchange partial results.
+</p>
+
+<h3>Summary of Opportunities</h3>
+
+<table>
+  <thead>
+    <tr><th>Book Insight</th><th>Applied To</th><th>Potential Savings</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="success">Power algorithm (Stepanov/Knuth)</td>
+      <td>Multiply subroutine</td>
+      <td>O(log&thinsp;b) vs O(b) &mdash; 9% for small b, dramatic for large b</td>
+    </tr>
+    <tr>
+      <td>Orbit detection (Stepanov)</td>
+      <td>Halt detection</td>
+      <td>Avoid millions of post-halt generations</td>
+    </tr>
+    <tr>
+      <td>Spatial parallelism (Iverson)</td>
+      <td>Full matmul</td>
+      <td>4&times; speedup for 2&times;2, m&middot;n&times; in general</td>
+    </tr>
+    <tr>
+      <td>Addition chains (Knuth)</td>
+      <td>Constant multiplies</td>
+      <td>Optimal sequence for each known constant</td>
+    </tr>
+    <tr>
+      <td>Eliminate the problem (Brodie)</td>
+      <td>Constant folding</td>
+      <td>2 additions for known-constant dot product</td>
+    </tr>
+    <tr>
+      <td>CSE (Dragon Book)</td>
+      <td>Shared multiplicands</td>
+      <td>Reuse partial products across dot products</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ════════════ Stack ════════════ -->
+
+<h2>Stack</h2>
+
+<table>
+  <thead>
+    <tr><th>Component</th><th>Implementation</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>GOL Computer</td><td>Scalable 8-bit CPU built from glider guns, eaters, and collisions</td></tr>
+    <tr><td>Assembler</td><td>Python &mdash; compiles matmul program to 22-bit ROM words</td></tr>
+    <tr><td>Hashlife simulator</td><td>Python &mdash; exponential-time GOL simulation for proof</td></tr>
+    <tr><td>Cell exporter</td><td>Python &mdash; extracts 1.4M cells to binary format for Swift</td></tr>
+    <tr><td>CoreML model</td><td>Python + <code>coremltools</code> &mdash; GOL step as <code>Conv2d(3&times;3)</code> + ReLU chain</td></tr>
+    <tr><td>Tiled simulator</td><td>Swift + CoreML + GCD &mdash; 8-thread pipelined GPU prediction</td></tr>
+    <tr><td>Hardware</td><td>Apple M4 Max (GPU: 40 cores, ANE: 16 cores)</td></tr>
+  </tbody>
+</table>
+
+<h3>Build &amp; Run</h3>
+
+<pre><code># Build the GOL CoreML model
+python3 emilio/gol-ane-inference/build_gol_model.py
+
+# Export programmed GOL computer cells
+python3 emilio/gol-ane-inference/export_cells.py
+
+# Build and run the tiled simulator
+cd emilio/gol-ane-inference
+swiftc -O -framework CoreML -framework Accelerate -o gol_ane main.swift
+./gol_ane --pipeline 8 --gens 5</code></pre>
+
+<!-- ════════════ Footer ════════════ -->
+
+<footer>
+  <p>
+    <a href="https://github.com/videlalvaro/emilio">GitHub repository</a> &middot;
+    Part of the Emilio project &mdash; exploring unconventional compute substrates for neural network inference.
+    <br>See also: <a href="index.html">Transformer Inference on the ANE via Conv2d(1&times;1)</a>
+  </p>
+</footer>
+
+</div>
+</body>
+</html>
