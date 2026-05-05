@@ -147,14 +147,17 @@ func runInference(modelPath: String, metaPath: String, text: String) throws {
         }
     }
 
-    // Build banded attention mask
+    // Build banded attention mask (with padding mask)
     let window = meta.sliding_window
     var attnMask = [Float16](repeating: Float16(-10000.0), count: seqLen * seqLen)
     for i in 0..<seqLen {
         let left = max(0, i - window)
         let right = min(seqLen, i + window + 1)
         for j in left..<right {
-            attnMask[i * seqLen + j] = Float16(0.0)
+            // Only attend to real (non-padding) tokens
+            if j < actualTokenCount {
+                attnMask[i * seqLen + j] = Float16(0.0)
+            }
         }
     }
 

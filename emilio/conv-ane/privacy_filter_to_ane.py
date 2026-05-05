@@ -33,6 +33,9 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -56,14 +59,13 @@ VOCAB_SIZE = 200064
 SWIGLU_LIMIT = 7.0
 
 
-def load_safetensors_weights(checkpoint_dir):
-    """Load weights from safetensors checkpoint."""
+def load_weights(checkpoint_dir):
+    """Load weights from safetensors as PyTorch tensors (handles bfloat16)."""
     from safetensors import safe_open
 
     weights = {}
     st_path = Path(checkpoint_dir) / "model.safetensors"
     if not st_path.exists():
-        # Try multi-file sharded format
         import glob
         st_files = sorted(glob.glob(str(Path(checkpoint_dir) / "model-*.safetensors")))
         if not st_files:
@@ -72,7 +74,7 @@ def load_safetensors_weights(checkpoint_dir):
         st_files = [str(st_path)]
 
     for f in st_files:
-        with safe_open(f, framework="numpy") as sf:
+        with safe_open(f, framework="pt") as sf:
             for key in sf.keys():
                 weights[key] = sf.get_tensor(key)
     return weights
@@ -80,10 +82,15 @@ def load_safetensors_weights(checkpoint_dir):
 
 def download_model():
     """Download the model from HuggingFace if not already cached."""
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import hf_hub_download
 
-    path = snapshot_download("openai/privacy-filter")
-    print(f"Model downloaded to: {path}")
+    files = ['config.json', 'tokenizer.json', 'tokenizer_config.json', 'model.safetensors']
+    path = None
+    for f in files:
+        p = hf_hub_download("openai/privacy-filter", f)
+        if path is None:
+            path = str(Path(p).parent)
+    print(f"Model at: {path}")
     return path
 
 
@@ -94,7 +101,6 @@ def build_rope_tables(max_seq_len):
         np.arange(0, HEAD_DIM, 2, dtype=np.float32) / HEAD_DIM
     )
 
-    # YaRN NTK-by-parts scaling
     if ROPE_SCALING_FACTOR > 1.0:
         concentration = 0.1 * math.log(ROPE_SCALING_FACTOR) + 1.0
         d_half_f = HEAD_DIM / 2
@@ -121,320 +127,278 @@ def build_rope_tables(max_seq_len):
     return rope_cos, rope_sin
 
 
+# ─── PyTorch Model for ANE ───────────────────────────────────────────────────
+
+class RMSNormANE(nn.Module):
+    def __init__(self, weight):
+        super().__init__()
+        self.eps = RMS_NORM_EPS
+        self.weight = nn.Parameter(weight.float().reshape(-1, 1, 1), requires_grad=False)
+
+    def forward(self, x):
+        # x: (B, C, 1, T)
+        xf = x.float()
+        variance = xf.pow(2).mean(dim=1, keepdim=True)
+        x_normed = xf * torch.rsqrt(variance + self.eps)
+        return (x_normed * self.weight).half()
+
+
+class AttentionLayerANE(nn.Module):
+    def __init__(self, layer_idx, weights, seq_len):
+        super().__init__()
+        prefix = f"model.layers.{layer_idx}"
+        self.nh = N_HEADS
+        self.nkv = N_KV_HEADS
+        self.dh = HEAD_DIM
+        self.hpk = N_HEADS // N_KV_HEADS  # 7
+        self.seq_len = seq_len
+
+        # Norm
+        self.norm = RMSNormANE(weights[f"{prefix}.input_layernorm.weight"])
+
+        # Fused QKV as Conv2d(1×1) — q:(896,640), k:(128,640), v:(128,640)
+        q_w = weights[f"{prefix}.self_attn.q_proj.weight"].half()  # (896, 640)
+        k_w = weights[f"{prefix}.self_attn.k_proj.weight"].half()  # (128, 640)
+        v_w = weights[f"{prefix}.self_attn.v_proj.weight"].half()  # (128, 640)
+        qkv_w = torch.cat([q_w, k_w, v_w], dim=0)  # (1152, 640)
+        qkv_dim = qkv_w.shape[0]
+
+        q_b = weights[f"{prefix}.self_attn.q_proj.bias"].half()
+        k_b = weights[f"{prefix}.self_attn.k_proj.bias"].half()
+        v_b = weights[f"{prefix}.self_attn.v_proj.bias"].half()
+        qkv_b = torch.cat([q_b, k_b, v_b])
+
+        self.qkv_conv = nn.Conv2d(D_MODEL, qkv_dim, 1, bias=True)
+        self.qkv_conv.weight = nn.Parameter(qkv_w.reshape(qkv_dim, D_MODEL, 1, 1), requires_grad=False)
+        self.qkv_conv.bias = nn.Parameter(qkv_b, requires_grad=False)
+
+        # Output proj: (640, 896) as Conv2d
+        o_w = weights[f"{prefix}.self_attn.o_proj.weight"].half()  # (640, 896)
+        o_b = weights[f"{prefix}.self_attn.o_proj.bias"].half()
+        self.out_conv = nn.Conv2d(N_HEADS * HEAD_DIM, D_MODEL, 1, bias=True)
+        self.out_conv.weight = nn.Parameter(o_w.reshape(D_MODEL, N_HEADS * HEAD_DIM, 1, 1), requires_grad=False)
+        self.out_conv.bias = nn.Parameter(o_b, requires_grad=False)
+
+        # Sinks (precompute sink_scores * ln2 in fp16)
+        sinks_raw = weights[f"{prefix}.self_attn.sinks"].float()
+        self.register_buffer("sink_scores", (sinks_raw * math.log(2.0)).half())
+
+    def forward(self, x, rope_cos, rope_sin, attn_mask):
+        """
+        x: (1, D, 1, T), rope_cos/sin: (T, d_half), attn_mask: (T, T)
+        """
+        T = self.seq_len
+        residual = x
+
+        normed = self.norm(x)
+        qkv = self.qkv_conv(normed)  # (1, 1152, 1, T)
+        qkv = qkv.squeeze(2).permute(0, 2, 1)  # (1, T, 1152)
+
+        q_dim = self.nh * self.dh  # 896
+        kv_dim = self.nkv * self.dh  # 128
+        q = qkv[:, :, :q_dim]
+        k = qkv[:, :, q_dim:q_dim + kv_dim]
+        v = qkv[:, :, q_dim + kv_dim:]
+
+        # RoPE — interleaved format (x[..., ::2], x[..., 1::2])
+        d_half = self.dh // 2
+
+        def apply_rope(x_flat, n_heads):
+            x_r = x_flat.reshape(1, T, n_heads, self.dh)
+            x1 = x_r[..., ::2]
+            x2 = x_r[..., 1::2]
+            cos = rope_cos[:T].unsqueeze(0).unsqueeze(2)  # (1, T, 1, d_half)
+            sin = rope_sin[:T].unsqueeze(0).unsqueeze(2)
+            o1 = x1 * cos - x2 * sin
+            o2 = x2 * cos + x1 * sin
+            return torch.stack((o1, o2), dim=-1).reshape(1, T, n_heads * self.dh)
+
+        q = apply_rope(q, self.nh)
+        k = apply_rope(k, self.nkv)
+
+        # QK scaling (split: qk_scale = 1/sqrt(sqrt(dh)))
+        qk_scale = 1.0 / math.sqrt(math.sqrt(self.dh))
+        q = q * qk_scale
+        k = k * qk_scale
+
+        # GQA attention
+        q = q.reshape(1, T, self.nkv, self.hpk, self.dh)
+        k = k.reshape(1, T, self.nkv, self.dh)
+        v = v.reshape(1, T, self.nkv, self.dh)
+
+        # scores: (1, nkv, hpk, T, T)
+        q_p = q.permute(0, 2, 3, 1, 4)  # (1, nkv, hpk, T, dh)
+        k_p = k.permute(0, 2, 3, 1).unsqueeze(2)  # (1, nkv, 1, dh, T)
+        scores = torch.matmul(q_p, k_p)  # (1, nkv, hpk, T, T)
+
+        # Apply mask
+        scores = scores + attn_mask.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+
+        # Sink: append extra column (precomputed sink_scores in fp16)
+        sink_col = self.sink_scores.reshape(1, self.nkv, self.hpk, 1, 1).expand(1, -1, -1, T, 1)
+        scores_with_sink = torch.cat([scores.float(), sink_col.float()], dim=-1)
+
+        attn_w = torch.softmax(scores_with_sink, dim=-1)
+        attn_w = attn_w[..., :-1].half()  # drop sink, (1, nkv, hpk, T, T)
+
+        # Weighted sum
+        v_p = v.permute(0, 2, 1, 3)  # (1, nkv, T, dh)
+        attn_out = torch.matmul(attn_w, v_p.unsqueeze(2))  # (1, nkv, hpk, T, dh)
+
+        # Reshape to (1, T, nh*dh) then (1, nh*dh, 1, T)
+        attn_out = attn_out.permute(0, 3, 1, 2, 4).reshape(1, T, self.nh * self.dh)
+        attn_out = attn_out.permute(0, 2, 1).unsqueeze(2)  # (1, 896, 1, T)
+
+        proj = self.out_conv(attn_out)  # (1, 640, 1, T)
+        return residual + proj
+
+
+class MoEBlockANE(nn.Module):
+    def __init__(self, layer_idx, weights, seq_len):
+        super().__init__()
+        prefix = f"model.layers.{layer_idx}"
+        self.seq_len = seq_len
+
+        self.norm = RMSNormANE(weights[f"{prefix}.post_attention_layernorm.weight"])
+
+        # Router
+        gate_w = weights[f"{prefix}.mlp.router.weight"].half()  # (128, 640)
+        gate_b = weights[f"{prefix}.mlp.router.bias"].half()    # (128,)
+        self.register_buffer("gate_weight", gate_w)
+        self.register_buffer("gate_bias", gate_b)
+
+        # Experts: gate_up_proj (128, 640, 1280), down_proj (128, 640, 640)
+        self.register_buffer("mlp1_weight",
+            weights[f"{prefix}.mlp.experts.gate_up_proj"].half())  # (128, 640, 1280)
+        self.register_buffer("mlp1_bias",
+            weights[f"{prefix}.mlp.experts.gate_up_proj_bias"].half())  # (128, 1280)
+        self.register_buffer("mlp2_weight",
+            weights[f"{prefix}.mlp.experts.down_proj"].half())  # (128, 640, 640)
+        self.register_buffer("mlp2_bias",
+            weights[f"{prefix}.mlp.experts.down_proj_bias"].half())  # (128, 640)
+
+    def forward(self, x):
+        """x: (1, D, 1, T) → (1, D, 1, T)
+
+        Sparse MoE: sort router logits, take top-4, gather expert weights,
+        run matmuls only for selected experts. Uses index_select which CoreML supports.
+        """
+        T = self.seq_len
+        D = D_MODEL
+        residual = x
+
+        normed = self.norm(x)
+        t = normed.squeeze(2).permute(0, 2, 1).reshape(T, D)  # (T, D)
+
+        # Router (fp16 throughout to avoid CoreML cast overflow)
+        g = F.linear(t, self.gate_weight, self.gate_bias)  # (T, 128)
+        sorted_vals, sorted_idx = torch.sort(g, dim=-1, descending=True)
+        top_vals = sorted_vals[:, :EXPERTS_PER_TOKEN]  # (T, 4)
+        top_idx = sorted_idx[:, :EXPERTS_PER_TOKEN]    # (T, 4)
+        expert_weights = torch.softmax(top_vals.float(), dim=-1).half()  # (T, 4)
+
+        # Gather selected expert weights
+        flat_idx = top_idx.reshape(-1)  # (T*4,)
+        mlp1_w_sel = torch.index_select(self.mlp1_weight, 0, flat_idx)  # (T*4, D, 2I)
+        mlp1_b_sel = torch.index_select(self.mlp1_bias, 0, flat_idx)    # (T*4, 2I)
+        mlp2_w_sel = torch.index_select(self.mlp2_weight, 0, flat_idx)  # (T*4, I, D)
+        mlp2_b_sel = torch.index_select(self.mlp2_bias, 0, flat_idx)    # (T*4, D)
+
+        # Reshape for batched matmul
+        mlp1_w_sel = mlp1_w_sel.reshape(T, EXPERTS_PER_TOKEN, D, 2 * INTERMEDIATE_SIZE)
+        mlp1_b_sel = mlp1_b_sel.reshape(T, EXPERTS_PER_TOKEN, 2 * INTERMEDIATE_SIZE)
+        mlp2_w_sel = mlp2_w_sel.reshape(T, EXPERTS_PER_TOKEN, INTERMEDIATE_SIZE, D)
+        mlp2_b_sel = mlp2_b_sel.reshape(T, EXPERTS_PER_TOKEN, D)
+
+        # MLP1: (T, 1, 1, D) @ (T, 4, D, 2I) -> (T, 4, 1, 2I)
+        t_exp = t.unsqueeze(1).unsqueeze(2)  # (T, 1, 1, D)
+        h = torch.matmul(t_exp, mlp1_w_sel)  # (T, 4, 1, 2I)
+        h = h.squeeze(2) + mlp1_b_sel  # (T, 4, 2I)
+
+        # SwiGLU (use float for sigmoid stability only)
+        h_glu = h[..., :INTERMEDIATE_SIZE].clamp(max=SWIGLU_LIMIT)
+        h_linear = h[..., INTERMEDIATE_SIZE:].clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+        h_act = (h_glu * torch.sigmoid(1.702 * h_glu.float()).half() * (h_linear + 1.0))  # (T, 4, I)
+
+        # MLP2: (T, 4, 1, I) @ (T, 4, I, D) -> (T, 4, 1, D)
+        h_act_exp = h_act.unsqueeze(2)  # (T, 4, 1, I)
+        out = torch.matmul(h_act_exp, mlp2_w_sel)  # (T, 4, 1, D)
+        out = out.squeeze(2) + mlp2_b_sel  # (T, 4, D)
+
+        # Weighted sum
+        out = (out * expert_weights.unsqueeze(-1)).sum(dim=1)  # (T, D)
+
+        # Reshape back
+        out = out.reshape(1, T, D).permute(0, 2, 1).unsqueeze(2)
+        return residual + out
+
+
+class PrivacyFilterANE(nn.Module):
+    def __init__(self, weights, seq_len):
+        super().__init__()
+        self.seq_len = seq_len
+
+        # Embedding
+        self.embedding = nn.Embedding(VOCAB_SIZE, D_MODEL)
+        self.embedding.weight = nn.Parameter(
+            weights["model.embed_tokens.weight"].half(), requires_grad=False)
+
+        # Transformer blocks
+        self.attn_layers = nn.ModuleList()
+        self.moe_layers = nn.ModuleList()
+        for i in range(N_LAYERS):
+            print(f"  Layer {i}/{N_LAYERS}...")
+            self.attn_layers.append(AttentionLayerANE(i, weights, seq_len))
+            self.moe_layers.append(MoEBlockANE(i, weights, seq_len))
+
+        # Final norm + classification head
+        self.output_norm = RMSNormANE(weights["model.norm.weight"])
+
+        cls_w = weights["score.weight"].half()  # (33, 640)
+        cls_b = weights["score.bias"].half()    # (33,)
+        self.cls_conv = nn.Conv2d(D_MODEL, NUM_LABELS, 1, bias=True)
+        self.cls_conv.weight = nn.Parameter(
+            cls_w.reshape(NUM_LABELS, D_MODEL, 1, 1), requires_grad=False)
+        self.cls_conv.bias = nn.Parameter(cls_b, requires_grad=False)
+
+    def forward(self, token_ids, rope_cos, rope_sin, attn_mask):
+        """
+        token_ids: (1, T) int32
+        rope_cos:  (T, d_half) fp16
+        rope_sin:  (T, d_half) fp16
+        attn_mask: (T, T) fp16
+        Returns: (1, NUM_LABELS, T) fp16
+        """
+        T = self.seq_len
+        x = self.embedding(token_ids)  # (1, T, D)
+        x = x.permute(0, 2, 1).unsqueeze(2)  # (1, D, 1, T)
+
+        for i in range(N_LAYERS):
+            x = self.attn_layers[i](x, rope_cos, rope_sin, attn_mask)
+            x = self.moe_layers[i](x)
+
+        x = self.output_norm(x)
+        logits = self.cls_conv(x)  # (1, 33, 1, T)
+        return logits.squeeze(2)   # (1, 33, T)
+
+
+# ─── Main Build ─────────────────────────────────────────────────────────────
+
 def build_model(checkpoint_dir, max_seq_len=512, quantize=False):
-    """Build CoreML model from Privacy Filter checkpoint."""
     import coremltools as ct
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
 
     print(f"Loading checkpoint: {checkpoint_dir}")
-    weights = load_safetensors_weights(checkpoint_dir)
+    weights = load_weights(checkpoint_dir)
+    print(f"  Loaded {len(weights)} tensors")
 
     print(f"Config: {N_LAYERS}L, d={D_MODEL}, nh={N_HEADS}, nkv={N_KV_HEADS}, "
           f"dh={HEAD_DIM}, experts={N_EXPERTS}, top-{EXPERTS_PER_TOKEN}")
     print(f"Seq len: {max_seq_len}, Float16, bidirectional banded attention")
 
-    # ── RoPE tables ──
+    # RoPE tables
     rope_cos, rope_sin = build_rope_tables(max_seq_len)
 
-    # ── PyTorch model ────────────────────────────────────────────────────
-
-    class RMSNormANE(nn.Module):
-        """RMSNorm operating on (B, C, 1, T) tensor layout for ANE."""
-        def __init__(self, weight):
-            super().__init__()
-            self.eps = RMS_NORM_EPS
-            # weight: (C, 1, 1) for broadcasting over (B, C, 1, T)
-            self.weight = nn.Parameter(
-                torch.tensor(weight, dtype=torch.float16).reshape(-1, 1, 1),
-                requires_grad=False)
-
-        def forward(self, x):
-            # x: (B, C, 1, T)
-            xf = x.float()
-            variance = xf.pow(2).mean(dim=1, keepdim=True)
-            x_normed = xf * torch.rsqrt(variance + self.eps)
-            return (x_normed * self.weight.float()).half()
-
-    class AttentionLayerANE(nn.Module):
-        """Bidirectional banded attention with GQA. Conv2d projections."""
-        def __init__(self, layer_idx, weights_dict):
-            super().__init__()
-            prefix = f"block.{layer_idx}.attn"
-            self.d = D_MODEL
-            self.nh = N_HEADS
-            self.nkv = N_KV_HEADS
-            self.dh = HEAD_DIM
-            self.hpk = N_HEADS // N_KV_HEADS  # 7
-            self.scale = 1.0 / HEAD_DIM  # qk_scale^2
-
-            # Norm
-            norm_w = weights_dict[f"{prefix}.norm.scale"]
-            self.norm = RMSNormANE(norm_w)
-
-            # QKV projection as Conv2d(1×1)
-            qkv_dim = HEAD_DIM * (N_HEADS + 2 * N_KV_HEADS)  # 64*(14+4) = 1152
-            qkv_w = weights_dict[f"{prefix}.qkv.weight"]  # (qkv_dim, d_model)
-            qkv_b = weights_dict[f"{prefix}.qkv.bias"]    # (qkv_dim,)
-            self.qkv_conv = nn.Conv2d(D_MODEL, qkv_dim, 1, bias=True)
-            self.qkv_conv.weight = nn.Parameter(
-                torch.tensor(qkv_w, dtype=torch.float16).reshape(qkv_dim, D_MODEL, 1, 1),
-                requires_grad=False)
-            self.qkv_conv.bias = nn.Parameter(
-                torch.tensor(qkv_b, dtype=torch.float16), requires_grad=False)
-
-            # Output projection as Conv2d(1×1)
-            out_w = weights_dict[f"{prefix}.out.weight"]  # (d_model, nh*dh)
-            out_b_key = f"{prefix}.out.bias"
-            self.out_conv = nn.Conv2d(N_HEADS * HEAD_DIM, D_MODEL, 1,
-                                      bias=out_b_key in weights_dict)
-            self.out_conv.weight = nn.Parameter(
-                torch.tensor(out_w, dtype=torch.float16).reshape(D_MODEL, N_HEADS * HEAD_DIM, 1, 1),
-                requires_grad=False)
-            if out_b_key in weights_dict:
-                self.out_conv.bias = nn.Parameter(
-                    torch.tensor(weights_dict[out_b_key], dtype=torch.float16),
-                    requires_grad=False)
-
-            # Sink logits
-            sink_w = weights_dict[f"{prefix}.sinks"]  # (n_heads,)
-            self.register_buffer("sinks",
-                torch.tensor(sink_w, dtype=torch.float32))
-
-        def forward(self, x, rope_cos, rope_sin, attn_mask):
-            """
-            x: (B, D, 1, T) fp16
-            rope_cos: (T, d_half) fp16
-            rope_sin: (T, d_half) fp16
-            attn_mask: (T, T) fp16 — banded mask (0=valid, -inf=masked)
-            Returns: (B, D, 1, T) fp16
-            """
-            B = x.shape[0]
-            T = x.shape[3]
-            residual = x
-
-            normed = self.norm(x)
-            # QKV: (B, qkv_dim, 1, T)
-            qkv = self.qkv_conv(normed)
-            qkv = qkv.squeeze(2)  # (B, qkv_dim, T)
-            qkv = qkv.permute(0, 2, 1)  # (B, T, qkv_dim)
-
-            q = qkv[:, :, :self.nh * self.dh]  # (B, T, nh*dh)
-            k = qkv[:, :, self.nh * self.dh:(self.nh + self.nkv) * self.dh]
-            v = qkv[:, :, (self.nh + self.nkv) * self.dh:]
-
-            # Apply RoPE
-            d_half = self.dh // 2
-            def apply_rope(x_flat, n_heads):
-                # x_flat: (B, T, n_heads*dh)
-                x_r = x_flat.reshape(B, T, n_heads, self.dh)
-                x1 = x_r[..., ::2]   # (B, T, nh, d_half)
-                x2 = x_r[..., 1::2]
-                cos = rope_cos[:T, :].unsqueeze(0).unsqueeze(2)  # (1, T, 1, d_half)
-                sin = rope_sin[:T, :].unsqueeze(0).unsqueeze(2)
-                o1 = x1 * cos - x2 * sin
-                o2 = x2 * cos + x1 * sin
-                out = torch.stack((o1, o2), dim=-1).reshape(B, T, n_heads, self.dh)
-                return out.reshape(B, T, n_heads * self.dh)
-
-            q = apply_rope(q, self.nh)
-            k = apply_rope(k, self.nkv)
-
-            # Scale Q and K (qk_scale = 1/sqrt(sqrt(dh)))
-            qk_scale = 1.0 / math.sqrt(math.sqrt(self.dh))
-            q = q * qk_scale
-            k = k * qk_scale
-
-            # Reshape for GQA attention
-            # q: (B, T, nkv, hpk, dh), k: (B, T, nkv, dh), v: (B, T, nkv, dh)
-            q = q.reshape(B, T, self.nkv, self.hpk, self.dh)
-            k = k.reshape(B, T, self.nkv, self.dh)
-            v = v.reshape(B, T, self.nkv, self.dh)
-
-            # Compute attention scores: Q*K^T
-            # scores: (B, T, nkv, hpk, T)
-            scores = torch.einsum("btghd,bsghd->btghs",
-                                  q, k.unsqueeze(3).expand(-1, -1, -1, self.hpk, -1))
-            # Wait — more efficient: einsum("btnhd,bsnd->btnhs", q_reshaped, k_reshaped)
-            # Let me redo: q(B,T,nkv,hpk,dh) @ k(B,S,nkv,dh) -> (B,nkv,hpk,T,S)
-            q_p = q.permute(0, 2, 3, 1, 4)  # (B, nkv, hpk, T, dh)
-            k_p = k.permute(0, 2, 1, 4).unsqueeze(2)  # (B, nkv, 1, dh, T) -- wait
-            # Actually: k is (B, T, nkv, dh) -> (B, nkv, T, dh) -> transpose -> (B, nkv, dh, T)
-            k_p = k.permute(0, 2, 3, 1)  # (B, nkv, dh, T)
-            scores = torch.matmul(q_p, k_p)  # (B, nkv, hpk, T, T)
-
-            # Apply banded attention mask + sink
-            scores = scores.float()
-            scores = scores + attn_mask.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-
-            # Add sink scores
-            sink_scores = (self.sinks * math.log(2.0))  # (n_heads,)
-            sink_scores = sink_scores.reshape(self.nkv, self.hpk, 1, 1)
-            # Append sink as extra "position"
-            sink_expanded = sink_scores.expand(B, -1, -1, T, 1)
-            scores_with_sink = torch.cat([scores, sink_expanded], dim=-1)
-
-            attn_w = torch.softmax(scores_with_sink, dim=-1)
-            attn_w = attn_w[..., :-1].half()  # drop sink column
-
-            # Weighted sum of values
-            v_p = v.permute(0, 2, 1, 3)  # (B, nkv, T, dh)
-            # attn_w: (B, nkv, hpk, T, T) @ v_p: (B, nkv, T, dh)
-            # -> need v_p as (B, nkv, 1, T, dh)
-            attn_out = torch.matmul(attn_w, v_p.unsqueeze(2))  # (B, nkv, hpk, T, dh)
-
-            # Reshape: (B, T, nh*dh)
-            attn_out = attn_out.permute(0, 3, 1, 2, 4).reshape(B, T, self.nh * self.dh)
-
-            # Output projection: need (B, nh*dh, 1, T)
-            attn_out = attn_out.permute(0, 2, 1).unsqueeze(2)  # (B, nh*dh, 1, T)
-            proj = self.out_conv(attn_out)
-            return residual + proj
-
-    class MoEBlockANE(nn.Module):
-        """Sparse MoE FFN block. Top-4 routing from 128 experts."""
-        def __init__(self, layer_idx, weights_dict):
-            super().__init__()
-            prefix = f"block.{layer_idx}.mlp"
-
-            norm_w = weights_dict[f"{prefix}.norm.scale"]
-            self.norm = RMSNormANE(norm_w)
-
-            # Gate/router
-            gate_w = weights_dict[f"{prefix}.gate.weight"]  # (n_experts, d_model)
-            gate_b = weights_dict.get(f"{prefix}.gate.bias")
-            self.gate_weight = nn.Parameter(
-                torch.tensor(gate_w, dtype=torch.float16), requires_grad=False)
-            if gate_b is not None:
-                self.gate_bias = nn.Parameter(
-                    torch.tensor(gate_b, dtype=torch.float16), requires_grad=False)
-            else:
-                self.gate_bias = None
-
-            # Expert weights: mlp1 (up+gate), mlp2 (down)
-            mlp1_w = weights_dict[f"{prefix}.mlp1_weight"]  # (n_experts, d_model, 2*intermediate)
-            mlp1_b = weights_dict[f"{prefix}.mlp1_bias"]    # (n_experts, 2*intermediate)
-            mlp2_w = weights_dict[f"{prefix}.mlp2_weight"]  # (n_experts, intermediate, d_model)
-            mlp2_b = weights_dict[f"{prefix}.mlp2_bias"]    # (n_experts, d_model)
-
-            self.register_buffer("mlp1_weight",
-                torch.tensor(mlp1_w, dtype=torch.float16))
-            self.register_buffer("mlp1_bias",
-                torch.tensor(mlp1_b, dtype=torch.float16))
-            self.register_buffer("mlp2_weight",
-                torch.tensor(mlp2_w, dtype=torch.float16))
-            self.register_buffer("mlp2_bias",
-                torch.tensor(mlp2_b, dtype=torch.float16))
-
-        def forward(self, x):
-            """
-            x: (B, D, 1, T) fp16
-            Returns: (B, D, 1, T) fp16
-            """
-            B, D, _, T = x.shape
-            residual = x
-
-            normed = self.norm(x)  # (B, D, 1, T)
-            # Reshape to (B*T, D) for routing
-            t = normed.squeeze(2).permute(0, 2, 1).reshape(B * T, D)  # (BT, D)
-
-            # Router
-            g = F.linear(t.float(), self.gate_weight.float(),
-                        self.gate_bias.float() if self.gate_bias is not None else None)
-            top_vals, top_idx = torch.topk(g, k=EXPERTS_PER_TOKEN, dim=-1)
-            expert_weights = torch.softmax(top_vals, dim=-1) / EXPERTS_PER_TOKEN
-
-            # Batched expert computation
-            # Gather expert weights for selected experts
-            # mlp1_weight[top_idx]: (BT, 4, D, 2*I)
-            mlp1_w = self.mlp1_weight[top_idx.reshape(-1)]  # (BT*4, D, 2*I)
-            mlp1_b = self.mlp1_bias[top_idx.reshape(-1)]    # (BT*4, 2*I)
-
-            t_expanded = t.unsqueeze(1).expand(-1, EXPERTS_PER_TOKEN, -1)  # (BT, 4, D)
-            t_flat = t_expanded.reshape(B * T * EXPERTS_PER_TOKEN, 1, D)  # (BT*4, 1, D)
-
-            # MLP1: (BT*4, 1, D) @ (BT*4, D, 2*I) -> (BT*4, 1, 2*I)
-            h = torch.bmm(t_flat.float(), mlp1_w.float())
-            h = h.squeeze(1) + mlp1_b.float()  # (BT*4, 2*I)
-
-            # SwiGLU
-            h_glu = h[..., :INTERMEDIATE_SIZE]
-            h_linear = h[..., INTERMEDIATE_SIZE:]
-            h_glu = h_glu.clamp(max=SWIGLU_LIMIT)
-            h_linear = h_linear.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-            h_act = h_glu * torch.sigmoid(1.702 * h_glu) * (h_linear + 1.0)
-
-            # MLP2
-            mlp2_w = self.mlp2_weight[top_idx.reshape(-1)]  # (BT*4, I, D)
-            mlp2_b = self.mlp2_bias[top_idx.reshape(-1)]    # (BT*4, D)
-            h_act = h_act.unsqueeze(1)  # (BT*4, 1, I)
-            out = torch.bmm(h_act, mlp2_w.float())  # (BT*4, 1, D)
-            out = out.squeeze(1) + mlp2_b.float()   # (BT*4, D)
-
-            # Weighted sum
-            out = out.reshape(B * T, EXPERTS_PER_TOKEN, D)
-            expert_weights_expanded = expert_weights.unsqueeze(-1)  # (BT, 4, 1)
-            out = (out * expert_weights_expanded).sum(dim=1)  # (BT, D)
-            out = out * EXPERTS_PER_TOKEN  # rescale
-
-            # Reshape back
-            out = out.half().reshape(B, T, D).permute(0, 2, 1).unsqueeze(2)  # (B, D, 1, T)
-            return residual + out
-
-    class PrivacyFilterANE(nn.Module):
-        """Full Privacy Filter model for ANE."""
-        def __init__(self, weights_dict):
-            super().__init__()
-
-            # Token embedding
-            embd_w = weights_dict["embedding.weight"]  # (vocab, d_model)
-            self.embedding = nn.Embedding(VOCAB_SIZE, D_MODEL)
-            self.embedding.weight = nn.Parameter(
-                torch.tensor(embd_w, dtype=torch.float16), requires_grad=False)
-
-            # Transformer blocks
-            self.attn_layers = nn.ModuleList()
-            self.moe_layers = nn.ModuleList()
-            for i in range(N_LAYERS):
-                print(f"  Loading layer {i}/{N_LAYERS}...")
-                self.attn_layers.append(AttentionLayerANE(i, weights_dict))
-                self.moe_layers.append(MoEBlockANE(i, weights_dict))
-
-            # Final norm
-            out_norm_w = weights_dict["norm.scale"]
-            self.output_norm = RMSNormANE(out_norm_w)
-
-            # Classification head (not LM head)
-            cls_w = weights_dict["unembedding.weight"]  # (num_labels, d_model)
-            self.cls_conv = nn.Conv2d(D_MODEL, NUM_LABELS, 1, bias=False)
-            self.cls_conv.weight = nn.Parameter(
-                torch.tensor(cls_w, dtype=torch.float16).reshape(NUM_LABELS, D_MODEL, 1, 1),
-                requires_grad=False)
-
-        def forward(self, token_ids, rope_cos, rope_sin, attn_mask):
-            """
-            token_ids: (1, T) int32
-            rope_cos:  (T, d_half) fp16
-            rope_sin:  (T, d_half) fp16
-            attn_mask:  (T, T) fp16
-            Returns: (1, NUM_LABELS, T) fp16 — per-token logits
-            """
-            # Embedding lookup
-            x = self.embedding(token_ids)  # (1, T, D)
-            # Reshape to ANE layout: (1, D, 1, T)
-            x = x.permute(0, 2, 1).unsqueeze(2)
-
-            for i in range(N_LAYERS):
-                x = self.attn_layers[i](x, rope_cos, rope_sin, attn_mask)
-                x = self.moe_layers[i](x)
-
-            x = self.output_norm(x)
-            logits = self.cls_conv(x)  # (1, NUM_LABELS, 1, T)
-            return logits.squeeze(2)   # (1, NUM_LABELS, T)
-
-    # ── Build attention mask ─────────────────────────────────────────────
-
+    # Banded attention mask
     print("Building banded attention mask...")
     mask = np.full((max_seq_len, max_seq_len), -1e4, dtype=np.float16)
     for i in range(max_seq_len):
@@ -443,98 +407,39 @@ def build_model(checkpoint_dir, max_seq_len=512, quantize=False):
         mask[i, left:right] = 0.0
     attn_mask_tensor = torch.tensor(mask, dtype=torch.float16)
 
-    # ── Map weight names ─────────────────────────────────────────────────
-
-    print("Mapping weight names...")
-    mapped_weights = {}
-    for key, val in weights.items():
-        # HF transformers format -> our internal format
-        new_key = key
-        # Common prefix removals for HF format
-        if new_key.startswith("model."):
-            new_key = new_key[len("model."):]
-        # Map "layers.X.self_attn.*" -> "block.X.attn.*"
-        new_key = new_key.replace("layers.", "block.")
-        new_key = new_key.replace("self_attn.", "attn.")
-        new_key = new_key.replace("input_layernorm.weight", "attn.norm.scale")
-        new_key = new_key.replace("post_attention_layernorm.weight", "mlp.norm.scale")
-        new_key = new_key.replace("attn.q_proj.", "attn.qkv_q.")
-        new_key = new_key.replace("attn.k_proj.", "attn.qkv_k.")
-        new_key = new_key.replace("attn.v_proj.", "attn.qkv_v.")
-        new_key = new_key.replace("attn.o_proj.", "attn.out.")
-        new_key = new_key.replace("embed_tokens.weight", "embedding.weight")
-        new_key = new_key.replace("model_norm.weight", "norm.scale")
-        new_key = new_key.replace("classifier.weight", "unembedding.weight")
-        # MoE mappings
-        new_key = new_key.replace("block_sparse_moe.gate.", "mlp.gate.")
-        new_key = new_key.replace("block_sparse_moe.", "mlp.")
-        mapped_weights[new_key] = val
-
-    # Check what keys we actually have
-    print(f"  Found {len(mapped_weights)} weight tensors")
-    sample_keys = sorted(mapped_weights.keys())[:20]
-    print(f"  Sample keys: {sample_keys}")
-
-    # ── Fuse QKV if separate ─────────────────────────────────────────────
-
-    for i in range(N_LAYERS):
-        q_key = f"block.{i}.attn.qkv_q.weight"
-        k_key = f"block.{i}.attn.qkv_k.weight"
-        v_key = f"block.{i}.attn.qkv_v.weight"
-        fused_key = f"block.{i}.attn.qkv.weight"
-
-        if q_key in mapped_weights and fused_key not in mapped_weights:
-            q_w = mapped_weights.pop(q_key)
-            k_w = mapped_weights.pop(k_key)
-            v_w = mapped_weights.pop(v_key)
-            mapped_weights[fused_key] = np.concatenate([q_w, k_w, v_w], axis=0)
-
-            # Bias
-            q_b_key = f"block.{i}.attn.qkv_q.bias"
-            k_b_key = f"block.{i}.attn.qkv_k.bias"
-            v_b_key = f"block.{i}.attn.qkv_v.bias"
-            if q_b_key in mapped_weights:
-                q_b = mapped_weights.pop(q_b_key)
-                k_b = mapped_weights.pop(k_b_key)
-                v_b = mapped_weights.pop(v_b_key)
-                mapped_weights[f"block.{i}.attn.qkv.bias"] = np.concatenate(
-                    [q_b, k_b, v_b])
-
-    # ── Build model ──────────────────────────────────────────────────────
-
+    # Build model
     print(f"\nBuilding PrivacyFilterANE ({N_LAYERS}L, fp16)...")
-    model = PrivacyFilterANE(mapped_weights)
+    model = PrivacyFilterANE(weights, max_seq_len)
     model.half()
     model.eval()
     n_params = sum(p.numel() for p in model.parameters()) + sum(
         b.numel() for b in model.buffers())
-    print(f"  {n_params:,} parameters (fp16)")
+    print(f"  {n_params:,} parameters")
 
-    # ── Trace ────────────────────────────────────────────────────────────
+    # Free raw weights
+    del weights
 
+    # Trace
     d_half = HEAD_DIM // 2
     token_ex = torch.randint(0, VOCAB_SIZE, (1, max_seq_len), dtype=torch.int32)
-    cos_ex = torch.tensor(rope_cos[:max_seq_len], dtype=torch.float16)
-    sin_ex = torch.tensor(rope_sin[:max_seq_len], dtype=torch.float16)
+    cos_ex = torch.tensor(rope_cos, dtype=torch.float16)
+    sin_ex = torch.tensor(rope_sin, dtype=torch.float16)
 
     print("\nTracing...")
     with torch.no_grad():
         outputs = model(token_ex, cos_ex, sin_ex, attn_mask_tensor)
-        print(f"  logits: {outputs.shape}, dtype: {outputs.dtype}")
+        print(f"  Output: {outputs.shape}, dtype: {outputs.dtype}")
 
     traced = torch.jit.trace(model, (token_ex, cos_ex, sin_ex, attn_mask_tensor))
 
-    # ── Convert to CoreML ────────────────────────────────────────────────
-
-    print(f"\nConverting to CoreML (fp16, {N_LAYERS}L)...")
-
+    # Convert to CoreML
+    print(f"\nConverting to CoreML...")
     ct_inputs = [
         ct.TensorType(name="token_ids", shape=(1, max_seq_len), dtype=np.int32),
         ct.TensorType(name="rope_cos", shape=(max_seq_len, d_half), dtype=np.float16),
         ct.TensorType(name="rope_sin", shape=(max_seq_len, d_half), dtype=np.float16),
         ct.TensorType(name="attn_mask", shape=(max_seq_len, max_seq_len), dtype=np.float16),
     ]
-
     ct_outputs = [ct.TensorType(name="logits", dtype=np.float16)]
 
     mlmodel = ct.convert(
@@ -543,32 +448,28 @@ def build_model(checkpoint_dir, max_seq_len=512, quantize=False):
         outputs=ct_outputs,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
         minimum_deployment_target=ct.target.iOS18,
-        compute_precision=ct.precision.FLOAT16,
+        # FLOAT32 compute required: fp16 produces all-zeros for 8-layer model
+        # due to CoreML MIL optimization pass bug with large gather+matmul graphs.
+        # Weights are still stored as fp16; only intermediate compute uses fp32.
+        compute_precision=ct.precision.FLOAT32,
     )
-
-    # ── Post-training int8 weight quantization ───────────────────────────
 
     if quantize:
         print("\nQuantizing weights to int8...")
         from coremltools.optimize.coreml import (
-            OpLinearQuantizerConfig,
-            OptimizationConfig,
-            linear_quantize_weights,
+            OpLinearQuantizerConfig, OptimizationConfig, linear_quantize_weights,
         )
         op_config = OpLinearQuantizerConfig(mode="linear_symmetric", dtype="int8")
         opt_config = OptimizationConfig(global_config=op_config)
         mlmodel = linear_quantize_weights(mlmodel, config=opt_config)
-        print("  Weights quantized to int8")
 
-    # ── Save ─────────────────────────────────────────────────────────────
-
+    # Save
     prefix = f"PrivacyFilterANE_{max_seq_len}"
     pkg_path = f"{prefix}.mlpackage"
     mlmodel.save(pkg_path)
     print(f"\n  Saved {pkg_path}")
 
-    # ── Metadata ─────────────────────────────────────────────────────────
-
+    # Metadata
     meta = {
         "model": "openai/privacy-filter",
         "task": "token-classification",
@@ -586,25 +487,6 @@ def build_model(checkpoint_dir, max_seq_len=512, quantize=False):
         "vocab_size": VOCAB_SIZE,
         "dtype": "float16",
         "quantized": quantize,
-        "id2label": {
-            "0": "O",
-            "1": "B-account_number", "2": "I-account_number",
-            "3": "E-account_number", "4": "S-account_number",
-            "5": "B-private_address", "6": "I-private_address",
-            "7": "E-private_address", "8": "S-private_address",
-            "9": "B-private_date", "10": "I-private_date",
-            "11": "E-private_date", "12": "S-private_date",
-            "13": "B-private_email", "14": "I-private_email",
-            "15": "E-private_email", "16": "S-private_email",
-            "17": "B-private_person", "18": "I-private_person",
-            "19": "E-private_person", "20": "S-private_person",
-            "21": "B-private_phone", "22": "I-private_phone",
-            "23": "E-private_phone", "24": "S-private_phone",
-            "25": "B-private_url", "26": "I-private_url",
-            "27": "E-private_url", "28": "S-private_url",
-            "29": "B-secret", "30": "I-secret",
-            "31": "E-secret", "32": "S-secret",
-        },
     }
     meta_path = f"{prefix}_meta.json"
     with open(meta_path, "w") as f:
@@ -613,16 +495,12 @@ def build_model(checkpoint_dir, max_seq_len=512, quantize=False):
 
     print(f"\n{'='*60}")
     print(f"  Model:      OpenAI Privacy Filter")
-    print(f"  Task:       Token Classification (PII detection)")
-    print(f"  Format:     CoreML mlprogram (iOS18+)")
-    print(f"  Dtype:      Float16 {'+ int8 weights' if quantize else ''}")
-    print(f"  Seq len:    {max_seq_len} (fixed, single pass)")
+    print(f"  Format:     CoreML (iOS18+, CPU_AND_NE)")
+    print(f"  Seq len:    {max_seq_len} (fixed)")
     print(f"  Attention:  Bidirectional banded (window={2*SLIDING_WINDOW+1})")
-    print(f"  FFN:        Sparse MoE ({N_EXPERTS} experts, top-{EXPERTS_PER_TOKEN})")
-    print(f"  Output:     {NUM_LABELS} classes (BIOES PII labels)")
-    print(f"  Target:     ANE (CPU_AND_NE)")
+    print(f"  FFN:        MoE ({N_EXPERTS} experts, top-{EXPERTS_PER_TOKEN})")
+    print(f"  Output:     {NUM_LABELS} PII classes")
     print(f"{'='*60}")
-
     return pkg_path
 
 

@@ -30,7 +30,7 @@ OpenAI Privacy Filter is a **bidirectional token-classification model** for PII 
 
 ### Architecture source
 
-The model implementation lives in the [openai/privacy-filter](https://github.com/openai/privacy-filter) repo under `opf/_model/model.py`. I read this in full to understand the exact architecture. Key classes:
+The model implementation lives in the [openai/privacy-filter](https://github.com/openai/privacy-filter) repo under `opf/_model/model.py`. Key classes:
 
 - `Transformer` — embedding → N blocks → norm → classification head
 - `AttentionBlock` — RMSNorm, fused QKV linear, RoPE, GQA with sink logits, banded attention via windowed SDPA
@@ -52,109 +52,180 @@ The model implementation lives in the [openai/privacy-filter](https://github.com
 
 ### 1. No KV cache
 
-Since this is an encoder (bidirectional, single-pass), there is no need for the stateful KV cache machinery that dominates the Qwen2 ANE converter. The entire sequence is processed at once and per-token logits are returned. This simplifies the CoreML model significantly.
+Since this is an encoder (bidirectional, single-pass), there is no need for the stateful KV cache machinery that dominates the Qwen2 ANE converter. The entire sequence is processed at once and per-token logits are returned.
 
 ### 2. ANE layout: Conv2d(1×1) for projections
 
-Following the same principle as the Qwen2 converter (`gguf_to_ane.py`), all linear projections (QKV, output, gate, expert MLPs) are expressed as Conv2d(1×1) operations. The ANE's convolution engine handles these as matrix multiplications. The tensor layout is `(B, C, 1, T)` — batch, channels, height=1, sequence length — which maps naturally to ANE's 4D tensor expectations.
+Following the same principle as the Qwen2 converter (`gguf_to_ane.py`), all linear projections (QKV, output, classification head) are expressed as Conv2d(1×1) operations. The tensor layout is `(B, C, 1, T)` — batch, channels, height=1, sequence length.
 
-### 3. Sparse MoE: hybrid ANE/CPU execution
+### 3. Sparse MoE via sort + index_select
 
-The MoE routing involves:
-1. Computing router logits (a simple linear — runs on ANE as Conv2d)
-2. Top-k selection (dynamic, data-dependent — must run on CPU)
-3. Gathering expert weights by index (dynamic indexing — CPU)
-4. Batched matmuls through selected experts (can run on ANE if shapes are fixed)
-5. Scatter-add results back (CPU)
+The MoE routing was the hardest part to get working in CoreML. The challenges:
 
-I set `compute_units = CPU_AND_NE` in CoreML and let the compiler decide the optimal split. In practice:
-- Attention (fixed-shape Conv2d + windowed matmul) → ANE
-- MoE routing + gather/scatter → CPU/GPU
-- Expert matmuls (batched bmm) → GPU or CPU depending on size
+**What doesn't work in CoreML/torch.jit.trace:**
+- `torch.topk` — produces dynamic shapes that CoreML cannot trace
+- Dense all-experts approach (compute all 128) — works for conversion but model is 2.6GB and prediction hangs (128 × 640 × 1280 = 105M params per layer × 8 layers of matmuls)
 
-This is the pragmatic approach. An alternative would be to materialize all 128 experts for every token and mask out unused ones, but that would waste 32× compute just to stay fully on ANE — not worthwhile for a model that's already small (50M active params).
+**What works:**
+- `torch.sort` (descending) + slice top-4 — CoreML supports sort
+- `torch.index_select` to gather the selected expert weights — CoreML supports this
+- Batched matmul on gathered weights: reshape to (T, 4, D, 2I) then `torch.matmul`
+
+The final sparse MoE pattern:
+```python
+# Router: sort to get top-4
+sorted_vals, sorted_idx = torch.sort(router_logits, dim=-1, descending=True)
+top_idx = sorted_idx[:, :4]  # (T, 4)
+expert_weights = softmax(sorted_vals[:, :4])  # (T, 4)
+
+# Gather selected expert weights
+flat_idx = top_idx.reshape(-1)  # (T*4,)
+mlp1_w_sel = torch.index_select(all_expert_weights, 0, flat_idx)  # (T*4, D, 2I)
+
+# Batched matmul
+mlp1_w_sel = mlp1_w_sel.reshape(T, 4, D, 2*I)
+h = torch.matmul(input.unsqueeze(1).unsqueeze(2), mlp1_w_sel)  # (T, 4, 1, 2I)
+```
 
 ### 4. Fixed input shapes
 
-The ANE replans execution graphs when input shapes change, which costs ~6ms. By fixing the sequence length at conversion time, we avoid this overhead entirely. The user specifies `--seq-len` (default 512) and inputs are padded to that length. The banded attention mask ensures padding tokens don't affect results.
+The ANE replans execution graphs when input shapes change (~6ms penalty). By fixing sequence length at conversion time, we avoid this. The user specifies `--seq-len` (default 512) and inputs are padded. The banded attention mask ensures padding tokens don't affect results.
 
 ### 5. Banded attention mask
 
-The model uses a symmetric band of ±128 positions (257 total window). I precompute this as a fixed `(T, T)` mask with 0.0 for valid positions and -10000.0 for masked positions. This is baked into the model as a constant input, avoiding any dynamic mask computation at runtime.
+Precomputed `(T, T)` mask: 0.0 for valid positions (within ±128 window), -10000.0 for masked positions. Passed as a fixed input constant.
 
 ### 6. Sink logits
 
-The original model uses "sink" attention — an extra virtual position in softmax that acts as a learned bias (attention sink). I preserve this by appending a learnable scalar to the attention scores before softmax, then discarding the corresponding output column. This matches the reference implementation exactly.
+The model uses "sink" attention — an extra virtual position in softmax that acts as a learned bias. Preserved by appending a precomputed scalar (sink_score × ln2) to attention scores before softmax, then discarding the corresponding output column. Sink scores are precomputed in fp16 at model load time to avoid runtime float32 casts.
 
-### 7. Weight name mapping
+### 7. YaRN RoPE
 
-The HuggingFace safetensors checkpoint uses transformers-style naming (`model.layers.0.self_attn.q_proj.weight`). The converter maps these to our internal naming (`block.0.attn.qkv.weight`) and fuses separate Q/K/V projections into a single tensor, matching the Conv2d(1×1) layout.
+Precomputed cos/sin tables with NTK-by-parts interpolation, concentration scaling. Passed as fixed inputs.
 
-### 8. YaRN RoPE
+### 8. SwiGLU activation
 
-The model uses YaRN (Yet another RoPE extensioN) with NTK-by-parts interpolation for long-context support. The converter precomputes the full cos/sin tables with the correct scaling and passes them as fixed inputs. This avoids runtime RoPE computation entirely.
+Custom SwiGLU: `sigmoid(1.702 * x) * x * (linear + 1.0)` with clamp at ±7.0. The sigmoid is computed in float32 for numerical stability, cast back to fp16 immediately.
 
-## Files Created
+## Benchmark Results
 
-### `emilio/conv-ane/privacy_filter_to_ane.py`
+Measured on Apple Silicon (M-series), `compute_units=CPU_AND_NE`:
+
+| Config | Seq Len | Mean Latency | Throughput | Notes |
+|--------|---------|-------------|------------|-------|
+| fp32 compute (correct) | 32 | 444 ms | 72 tok/s | 100% label agreement with HF reference |
+| fp16 compute (broken) | 32 | 145 ms | 221 tok/s | Outputs zeros due to CoreML MIL bug |
+| fp16 compute (broken) | 128 | 920 ms | 139 tok/s | Same zeros issue |
+
+### Verification Against Reference
+
+**100% label agreement** verified between CoreML model and HuggingFace transformers reference:
+- Test text: `"My name is Alice Smith and my email is alice.smith@example.com"`
+- HF predictions: `[O, O, O, B-person, E-person, O, O, O, O, B-email, I-email, I-email, I-email, E-email]`
+- CoreML predictions: identical
+- Logits: HF [-8.23, 24.31], CoreML [-7.84, 24.22] (minor fp16 weight rounding)
+
+**Critical:** The attention mask must incorporate padding (positions where no real tokens exist should be masked with `-10000`). Without this, the model predicts PII everywhere. This matches the HF model behavior with `attention_mask`.
+
+## Known Issues
+
+### fp16 Compute Precision Produces Zeros (8 layers)
+
+**Symptom:** The full 8-layer model with `compute_precision=FLOAT16` produces all-zero logits. Models with ≤2 layers work correctly.
+
+**Root Cause:** CoreML's MIL optimization passes apply constant folding and fp16 casts. With 8 layers of `index_select` + large tensor reshapes, some intermediate computation overflows or gets incorrectly optimized. The `RuntimeWarning: overflow encountered in cast` during conversion is the telltale.
+
+**Status:** Unresolved. Using `compute_precision=FLOAT32` as workaround (weights still fp16, only compute is fp32). This gives 72 tok/s which is sufficient for real-time PII detection.
+
+**Impact:** ~3× throughput loss vs theoretical fp16 performance (72 vs 221 tok/s).
+
+### Attention Mask Must Include Padding
+
+The model requires padding tokens to be masked in the attention mask. The `attn_mask` input should be constructed as:
+```python
+mask[i, j] = 0.0    # if j is a real token AND within banded window
+mask[i, j] = -10000  # if j is padding OR outside banded window
+```
+
+Without proper padding masking, the model predicts PII labels on every token.
+
+### Model Size
+
+The full model is ~2.6GB in fp16 due to the MoE expert weights:
+- Per layer: 128 experts × (640×1280 + 1280 + 640×640 + 640) = ~157M params
+- 8 layers of MoE: ~1.26B params in experts alone
+- Plus attention (~19M), embeddings (~128M), etc.
+
+**Mitigation:** Use `--quantize` flag for int8 weight quantization (~1.3GB) or int4 palettization (~650MB).
+
+## Files
+
+### `privacy_filter_to_ane.py`
 
 Python converter that:
 1. Downloads or loads the `openai/privacy-filter` safetensors checkpoint
 2. Maps HuggingFace weight names to internal format
-3. Fuses Q/K/V projections
-4. Builds a PyTorch model with Conv2d(1×1) projections (ANE-optimized layout)
-5. Traces and converts to CoreML with `coremltools`
+3. Fuses Q/K/V projections into single Conv2d(1×1)
+4. Builds PyTorch model with sparse MoE (sort + index_select + batched matmul)
+5. Traces with `torch.jit.trace` and converts to CoreML via `coremltools`
 6. Optionally quantizes weights to int8
 7. Exports metadata JSON
 
 **Usage:**
 ```bash
-python3 privacy_filter_to_ane.py --seq-len 512 --quantize
+# Requires Python 3.12 (coremltools incompatible with 3.14)
+source .venv312/bin/activate
+
+# Basic conversion (seq_len=32 for testing)
+python3 privacy_filter_to_ane.py \
+  --checkpoint /path/to/openai-privacy-filter \
+  --seq-len 32
+
+# With int8 quantization (halves model size)
+python3 privacy_filter_to_ane.py \
+  --checkpoint /path/to/openai-privacy-filter \
+  --seq-len 128 --quantize
 ```
 
 **Outputs:**
-- `PrivacyFilterANE_512.mlpackage` — CoreML model
-- `PrivacyFilterANE_512_meta.json` — Architecture metadata + label mapping
+- `PrivacyFilterANE_{seq_len}.mlpackage` — CoreML model
+- `PrivacyFilterANE_{seq_len}_meta.json` — Architecture metadata
 
-### `emilio/conv-ane/privacy_filter_ane.swift`
+### `privacy_filter_ane.swift`
 
 Swift inference runner that:
 1. Loads the compiled CoreML model targeting ANE
-2. Tokenizes input text (simplified byte-level; production should use the full BPE tokenizer from `tokenizer.json`)
+2. Tokenizes input text (simplified byte-level; production should use BPE from `tokenizer.json`)
 3. Builds RoPE tables and banded attention mask
 4. Runs single-pass inference
-5. Decodes per-token argmax predictions into BIOES spans
-6. Prints detected PII entities with labels and positions
+5. Decodes per-token predictions into BIOES spans
+6. Prints detected PII entities
 
 **Usage:**
 ```bash
 swiftc -O -o privacy_filter_ane privacy_filter_ane.swift \
   -framework CoreML -framework Foundation
-./privacy_filter_ane PrivacyFilterANE_512.mlpackage \
-  PrivacyFilterANE_512_meta.json \
+./privacy_filter_ane PrivacyFilterANE_128.mlpackage \
+  PrivacyFilterANE_128_meta.json \
   "My name is Alice Smith and my email is alice@example.com"
 ```
 
-## Performance Expectations
+### `validate_privacy_filter.py`
 
-Based on the existing Qwen2 ANE results (171 tok/s decode for 494M active params):
+Validation script (see below) that compares CoreML output against HuggingFace reference.
 
-- Privacy Filter has ~50M active params per token (10× smaller)
-- Single-pass over 512 tokens means 512 tokens processed at once
-- Expected throughput: **high** — the bottleneck will be the MoE gather/scatter on CPU, not the ANE attention
-- The model is small enough that even CPU-only inference is fast; ANE acceleration primarily helps with the attention convolutions
+## Development Environment
 
-## Limitations & Future Work
+- **Python 3.12** required (coremltools broken on 3.14 — missing `libmilstoragepython`)
+- Virtual env: `.venv312/` with torch, coremltools, safetensors, transformers
+- HF checkpoint cached at: `~/.cache/huggingface/hub/models--openai--privacy-filter/`
+- Disk requirement: ~6GB free for conversion (2.6GB model + temp files)
 
-1. **Tokenizer**: The Swift runner uses simplified byte-level encoding. For production, implement the full BPE tokenizer from the model's `tokenizer.json` (200k vocab GPT-style BPE).
+## Next Steps
 
-2. **Viterbi decoding**: The reference implementation uses constrained Viterbi span decoding with transition biases for coherent BIOES labels. The Swift runner currently uses simple argmax. Adding Viterbi would improve span boundary quality.
-
-3. **Dynamic sequence length**: Currently fixed at conversion time. For variable-length inputs, either convert multiple models (e.g., 128, 512, 2048) or pad all inputs to the max.
-
-4. **MoE optimization**: If profiling shows the MoE is the bottleneck, consider:
-   - Distilling to a dense model for pure-ANE execution
-   - Using Metal compute shaders for the expert routing
-   - Pruning to fewer experts with fine-tuning
-
-5. **Batch processing**: The model supports batch>1 for throughput. The CoreML model could be extended to accept batched inputs for processing multiple documents simultaneously.
+1. **Int8 quantization:** Apply post-conversion quantization to reduce from 2.6GB → 1.3GB
+2. **Full BPE tokenizer:** Implement proper tokenizer in Swift using `tokenizer.json`
+3. **Viterbi decoding:** Add constrained Viterbi span decoding for coherent BIOES labels
+4. **Production seq_len:** Convert at seq_len=128 or 256 (balance between coverage and latency)
+5. **fp16 investigation:** File CoreML bug / try coremltools nightly for the MIL overflow issue
+6. **Benchmark on-device:** Profile ANE vs CPU utilization with Instruments
